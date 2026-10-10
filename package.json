@@ -1,0 +1,39 @@
+{
+  "name": "pi-gatekeeper",
+  "version": "0.1.0",
+  "description": "Gates every pi tool call through static rules and a decision model, so destructive, secret-exposing, or out-of-scope actions stop before they run.",
+  "type": "module",
+  "private": true,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "gatekeeper",
+    "security"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ],
+    "skills": [
+      "./skills/gatekeeper-config"
+    ]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "^1.0.0",
+    "@types/node": "^25.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.0"
+  },
+  "dependencies": {
+    "smol-toml": "^1.9.0"
+  }
+}
