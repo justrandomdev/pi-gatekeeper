@@ -29,6 +29,26 @@ Model failure or timeout routes to the operator (`failMode: ask`) or blocks (`fa
 - Residual: the decision log records the first 100 characters of arguments — a short secret inside them lands in `decisions.jsonl`. The log directory is created `0o700`; rotate with `log.retentionDays`.
 - Residual: secrets past the 256KB per-call scan cap, and obfuscations the gitleaks corpus doesn't cover, fall through to the model gate.
 
+## Installation
+
+```bash
+pi install git:https://github.com/justrandomdev/pi-gatekeeper
+```
+
+Installs the plugin at user level — the gate loads in every pi session, along with the `gatekeeper-config` skill. Verify with `pi list`; remove with `pi remove <source>`.
+
+## Slash command configuration
+
+The gate is configured at runtime with slash commands, typed by you in the TUI — the agent cannot invoke them:
+
+- `/gate` — status (endpoints, mode, threshold, rules, log, session stats); `/gate model <name>` — select the served endpoint
+- `/gate:rules` — list / add / remove / test rules (`--project` writes project level)
+- `/gate:config` — show effective config or set any key: `threshold`, `endpoint.*`, `multiEndpointMode`, `notify`, …
+- `/gate:secrets` — secrets engine status / `update` / `test "<text>"`
+- `/gate:log [n] [tool]` — review recent decisions
+
+Full command reference: the [Slash commands](#slash-command-reference) section below. Manual JSON edits are next.
+
 ## Manual configuration
 
 Config lives in two levels (JSON):
@@ -279,7 +299,7 @@ The scan covers the full `bash`/`powershell` command and the full serialized arg
 
 `decisions.jsonl` (plus rotated `.1`, `.2`, …) — one JSON line per decision: timestamp, tool, the same first-100-character argument view the model saw (plus the total length; a secrets block logs a constant in the args column — a detected secret never lands in this log), action, source (`rule` / `model` / `operator` / `fail` / `protected` / `secrets` / `disabled`), classification, confidence, and the reason. A jury run attaches the per-endpoint verdicts as a `jury` array (`name`, `choice`, `confidence`, `probabilities`; an unavailable endpoint is recorded as such) — a fallback chain's attempts in the same shape, and a modelSelect run names its serving judge in an `endpoint` field. Full file contents never reach the model state (ADR-0002) or this log — but a short secret the corpus misses, inside the first 100 characters of a command, is an argument and does land here.
 
-## Slash commands
+## Slash command reference
 
 All commands are operator-run; the agent cannot invoke them.
 
