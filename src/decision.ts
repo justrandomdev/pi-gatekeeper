@@ -5,11 +5,11 @@
  */
 
 import type { ClassifyInput, Classification, ClassificationResult, ClassifierEndpoint } from "./classifier.js";
-import { resolveEndpoints, resolveMode, selectEndpoint, type GatekeeperConfig, type MultiEndpointMode, type NamedEndpoint } from "./config.js";
+import { resolveEndpoints, resolveGateMode, resolveMode, selectEndpoint, type GatekeeperConfig, type GateMode, type MultiEndpointMode, type NamedEndpoint } from "./config.js";
 import { gateDirs, matchRules, protectedPatterns, touchesGatePaths, type Rule } from "./rules.js";
 import type { SecretsHit } from "./secrets.js";
 
-export type DecisionSource = "disabled" | "protected" | "secrets" | "rule" | "model" | "operator" | "fail";
+export type DecisionSource = "disabled" | "protected" | "secrets" | "rule" | "model" | "operator" | "auto" | "fail";
 
 export interface Decision {
   action: "allow" | "block";
@@ -39,6 +39,9 @@ export interface LogRecord {
   jury?: JuryVerdict[];
   /** The serving judge's resolved name when modelSelect ran (ADR-0007). */
   endpoint?: string;
+  /** The pi session this call belongs to (ADR-0008); taken live at write
+   *  time so a session's decisions are retrievable across a shared log. */
+  sessionId?: string;
   reason?: string;
 }
 
@@ -82,6 +85,8 @@ export interface GateDeps {
   /** Classify against one endpoint; the gate fans out over the resolved
    *  endpoints itself, per the multi-endpoint act (ADR-0006/0007). */
   classify(input: ClassifyInput, endpoint: NamedEndpoint): Promise<ClassificationResult>;
+  /** The current pi session id, for the decision log (ADR-0008). */
+  getSessionId?(): string | undefined;
   askOperator(prompt: OperatorPromptInfo): Promise<"allow" | "deny" | "no-ui">;
   notify(line: string): void;
   writeLog(record: LogRecord): void;
@@ -102,6 +107,16 @@ const MODEL_ARGS_CHARS = 100;
  *  not a knob — same reasoning as MODEL_ARGS_CHARS. An answer without
  *  probabilities counts as unmet (fail-closed: the call asks). */
 const MAX_UNSAFE_PROBABILITY = 0.15;
+
+/** Sources whose logged arguments are replaced wholesale: a `secrets` hit
+ *  (the matched text must never enter the log) and a `protected` block —
+ *  self-protection runs *before* the secrets scan, so it can carry a
+ *  credential the scan never saw. `disabled` is deliberately not listed:
+ *  the call runs, so the log is its pass-through transcript. */
+const REDACTED_ARGS: Partial<Record<DecisionSource, string>> = {
+  secrets: "<blocked: secrets>",
+  protected: "<blocked: gate path>",
+};
 
 function cap(text: string, budget: number): string {
   return text.length <= budget ? text : `${text.slice(0, budget)}…`;
@@ -138,13 +153,15 @@ export function createGate(deps: GateDeps): Gate {
       // (ADR-0007); the singular `endpoint` is one judge regardless of mode.
       const multi = (config.endpoints?.length ?? 0) > 0;
       let mode: MultiEndpointMode | undefined;
+      let gateMode: GateMode | undefined;
 
       const raw = JSON.stringify(args ?? {});
       // The operator prompt keeps a capped preview — the operator is human.
-      // The model and the log see only the first 100 characters.
+      // The model sees only the first 100 characters (the ADR-0002 egress
+      // boundary); the decision log records the full arguments, since the
+      // operator reviews the log to understand what actually ran.
       const argsSummary = cap(raw, config.log.truncateArgsBytes);
       const modelArgs = raw.slice(0, MODEL_ARGS_CHARS);
-      const logArgs = raw.length > MODEL_ARGS_CHARS ? `${modelArgs}… (${raw.length} chars)` : modelArgs;
 
       const finish = (decision: Decision): Decision => {
         const label =
@@ -182,18 +199,18 @@ export function createGate(deps: GateDeps): Gate {
                   ? "[modelSelect] "
                   : ""
             : "";
+          const autoTag = decision.source === "auto" ? "[auto] " : "";
           const servingName = tag === "[modelSelect] " ? ` ${decision.endpoint}` : "";
           deps.notify(
-            `gate › ${tag}${tool}: ${label}${juryLine}${servingName} → ${decision.action === "allow" ? "allowed" : "blocked"} (${decision.source})${fallbackLine}`,
+            `gate › ${autoTag}${tag}${tool}: ${label}${juryLine}${servingName} → ${decision.action === "allow" ? "allowed" : "blocked"} (${decision.source})${fallbackLine}`,
           );
         }
-        // A secrets hit can put the matched text inside the first 100
-        // characters of the serialized args — exactly the view logArgs
-        // captures — so logging it verbatim would copy the secret into
-        // the decision log. The masked peek already rides in `reason`;
-        // the args column becomes a constant for secrets decisions.
-        // Other sources never carry their trigger inside the args view.
-        const loggedArgs = decision.source === "secrets" ? "<blocked: secrets>" : logArgs;
+        // The log records the full arguments, so any source that stopped the
+        // call *before* the secrets scan ran must redact: a `protected` block
+        // can carry a credential the operator was writing into the gate
+        // config, and the scan never saw it (ADR-0003 precedes ADR-0004).
+        // The masked peek already rides in `reason`.
+        const loggedArgs = REDACTED_ARGS[decision.source] ?? raw;
         deps.writeLog({
           tool,
           args: loggedArgs,
@@ -204,6 +221,7 @@ export function createGate(deps: GateDeps): Gate {
           probabilities: decision.probabilities,
           jury: decision.jury,
           endpoint: decision.endpoint,
+          sessionId: deps.getSessionId?.(),
           reason: decision.reason,
         });
         return decision;
@@ -212,12 +230,14 @@ export function createGate(deps: GateDeps): Gate {
       // Self-protection (ADR-0003): before the enabled check and every
       // layer, overridable by none — it holds even while the gate is
       // disabled, so a disabled gate cannot be used as a door.
-      if (await touchesGatePaths(tool, args, deps.home, cwd)) {
+      const gatedPath = await touchesGatePaths(tool, args, deps.home, cwd);
+      if (gatedPath) {
         return finish({
           action: "block",
           source: "protected",
-          reason:
-            "the gate protects its own configuration, log, and secrets definitions; agent tool calls touching them are always denied. The operator configures the gate with /gate commands or a manual edit.",
+          // The path only — the args stay redacted in the log, so naming the
+          // target here is what keeps a protected block diagnosable.
+          reason: `the gate protects its own configuration, log, and secrets definitions; agent tool calls touching them are always denied (touched ${gatedPath}). The operator configures the gate with /gate commands or a manual edit.`,
         });
       }
 
@@ -266,6 +286,7 @@ export function createGate(deps: GateDeps): Gate {
       let servingName: string | undefined; // modelSelect's judge, for the log
       try {
         mode = resolveMode(config);
+        gateMode = resolveGateMode(config);
         const input: ClassifyInput = {
           tool,
           args: modelArgs,
@@ -330,6 +351,13 @@ export function createGate(deps: GateDeps): Gate {
       // verdict, a fallback chain its attempts, modelSelect just the name.
       const recordVerdicts = isJury || (multi && mode === "fallback");
       const isModelSelect = multi && mode === "modelSelect";
+      // The verdict detail every branch attaches: a jury/fallback chain lists
+      // every verdict, modelSelect is named by `endpoint` alone — except in
+      // the ask prompt, where the single judge's row is what the operator
+      // reads. One shape each, built once.
+      const judge = isModelSelect ? servingName : undefined;
+      const verdictDetail = { jury: recordVerdicts ? verdicts : undefined, endpoint: judge };
+      const askDetail = { jury: recordVerdicts || isModelSelect ? verdicts : undefined, endpoint: judge };
 
       // Most pessimistic first: any confident unsafe auto-blocks, whoever
       // said it.
@@ -344,8 +372,7 @@ export function createGate(deps: GateDeps): Gate {
           classification: "unsafe",
           confidence: blocking.confidence,
           probabilities: blocking.probabilities,
-          jury: recordVerdicts ? verdicts : undefined,
-          endpoint: isModelSelect ? servingName : undefined,
+          ...verdictDetail,
         });
       }
 
@@ -358,8 +385,7 @@ export function createGate(deps: GateDeps): Gate {
           reason: isJury
             ? unavailable.map((v) => verdictObjection(v, config.threshold, true)).join("; ")
             : `model unavailable: ${unavailable[0]?.error ?? "no answer"}`,
-          jury: recordVerdicts ? verdicts : undefined,
-          endpoint: isModelSelect ? servingName : undefined,
+          ...verdictDetail,
         });
       }
 
@@ -377,8 +403,7 @@ export function createGate(deps: GateDeps): Gate {
           classification: "safe",
           confidence: weakest,
           probabilities: serving[0].probabilities,
-          jury: recordVerdicts ? verdicts : undefined,
-          endpoint: isModelSelect ? servingName : undefined,
+          ...verdictDetail,
         });
       }
 
@@ -410,24 +435,40 @@ export function createGate(deps: GateDeps): Gate {
       };
       const shown = aggregate();
 
+      // Auto mode (ADR-0008) voids the ask side of the matrix: unsure,
+      // below-threshold, and bound-exceeded safe allow instead of asking.
+      // The threshold still defines a confident *block* (unchanged), and
+      // `fail` (every judge unavailable) still asks under failMode.
+      if (gateMode === "auto" && !noVerdict) {
+        return finish({
+          action: "allow",
+          source: "auto",
+          reason,
+          classification: shown.classification,
+          confidence: shown.confidence,
+          probabilities: shown.probabilities,
+          ...askDetail,
+        });
+      }
+
       const outcome = await deps.askOperator({
         tool,
         argsSummary,
         classification: shown.classification,
         confidence: shown.confidence,
         probabilities: shown.probabilities,
-        jury: recordVerdicts || isModelSelect ? verdicts : undefined,
         reason,
+        ...askDetail,
       });
 
       const cause: DecisionSource = configError || noVerdict ? "fail" : "operator";
       if (outcome === "no-ui") {
-        return finish({ action: "block", source: cause, reason: `${reason}; no UI available to confirm`, jury: recordVerdicts || isModelSelect ? verdicts : undefined, endpoint: isModelSelect ? servingName : undefined });
+        return finish({ action: "block", source: cause, reason: `${reason}; no UI available to confirm`, ...askDetail });
       }
       if (outcome === "deny") {
-        return finish({ action: "block", source: cause, reason: `${reason}; operator denied`, jury: recordVerdicts || isModelSelect ? verdicts : undefined, endpoint: isModelSelect ? servingName : undefined });
+        return finish({ action: "block", source: cause, reason: `${reason}; operator denied`, ...askDetail });
       }
-      return finish({ action: "allow", source: cause, reason: `${reason}; operator allowed`, jury: recordVerdicts || isModelSelect ? verdicts : undefined, endpoint: isModelSelect ? servingName : undefined });
+      return finish({ action: "allow", source: cause, reason: `${reason}; operator allowed`, ...askDetail });
     },
   };
 }

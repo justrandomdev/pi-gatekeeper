@@ -11,6 +11,7 @@ function makeDeps(overrides: {
   classify?: (input: any, endpoint: any) => Promise<ClassificationResult>;
   askOperator?: (prompt: any) => Promise<"allow" | "deny" | "no-ui">;
   scanSecrets?: (tool: string, args: any) => Promise<SecretsHit | undefined>;
+  getSessionId?: () => string | undefined;
 } = {}): { deps: GateDeps; log: any[]; notified: string[]; classifyCalls: any[]; asked: any[] } {
   const log: any[] = [];
   const notified: string[] = [];
@@ -33,6 +34,7 @@ function makeDeps(overrides: {
       asked.push(prompt);
       return overrides.askOperator?.(prompt) ?? "deny";
     },
+    getSessionId: overrides.getSessionId,
     notify: (line) => notified.push(line),
     writeLog: (record) => log.push(record),
     scanSecrets: async (tool, args) => overrides.scanSecrets?.(tool, args),
@@ -151,9 +153,10 @@ describe("the gate", () => {
     // the model saw at most 100 characters, and the secret sits beyond them
     expect(classifyCalls[0].input.args.length).toBeLessThanOrEqual(100);
     expect(classifyCalls[0].input.args).not.toContain("hunter2-secret-value");
-    // the log records the same view plus the total length
-    expect(log[0].args).not.toContain("hunter2-secret-value");
-    expect(log[0].args).toMatch(/\(\d+ chars\)$/);
+    // the log records the full arguments so the operator can see what ran;
+    // this is the widened residual (the model's view stays bounded).
+    expect(log[0].args).toContain("hunter2-secret-value");
+    expect(log[0].args).not.toMatch(/\(\d+ chars\)$/);
     // the operator prompt keeps a capped preview — the operator is human
     expect(asked[0].argsSummary).toContain("hunter2-secret-value");
   });
@@ -658,3 +661,253 @@ describe("the gate", () => {
     expect(decision.source).toBe("model");
   });
 });
+
+describe("auto mode (ADR-0008)", () => {
+  it("allows unsure classifications with source auto, never asking", async () => {
+    const { deps, log, notified, asked } = makeDeps({
+      config: { mode: "auto" },
+      classify: async () => classifyResult("unsure", 0.9),
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "bash", args: { command: "systemctl restart app" }, task: "t" });
+    expect(decision.action).toBe("allow");
+    expect(decision.source).toBe("auto");
+    expect(decision.reason).toContain("model unsure");
+    expect(asked).toHaveLength(0);
+    expect(log[0].source).toBe("auto");
+    expect(notified[0]).toContain("[auto] ");
+  });
+
+  it("allows below-threshold safe classifications", async () => {
+    const { deps, asked } = makeDeps({
+      config: { mode: "auto" },
+      classify: async () => classifyResult("safe", 0.5),
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "read", args: { path: "/tmp/a" }, task: "t" });
+    expect(decision.action).toBe("allow");
+    expect(decision.source).toBe("auto");
+    expect(asked).toHaveLength(0);
+  });
+
+  it("allows a safe classification above the unsafe-probability bound — the bound is inert (risk accepted)", async () => {
+    const { deps, asked } = makeDeps({
+      config: { mode: "auto" },
+      classify: async () => ({ choice: "safe", probabilities: { safe: 0.5, unsafe: 0.5, unsure: 0.0 }, confidence: 0.9 }),
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "read", args: { path: "/tmp/a" }, task: "t" });
+    expect(decision.action).toBe("allow");
+    expect(decision.source).toBe("auto");
+    expect(asked).toHaveLength(0);
+  });
+
+  it("still blocks a confident unsafe classification", async () => {
+    const { deps, asked } = makeDeps({
+      config: { mode: "auto" },
+      classify: async () => classifyResult("unsafe", 0.9),
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "bash", args: { command: "rm -rf /" }, task: "t" });
+    expect(decision.action).toBe("block");
+    expect(decision.source).toBe("model");
+    expect(asked).toHaveLength(0);
+  });
+
+  it("still blocks deny rules and secrets hits (the deterministic layers are untouched)", async () => {
+    const ruleDeps = makeDeps({
+      config: { mode: "auto", rules: [{ action: "deny", tools: ["bash"], pattern: "rm -rf" }] },
+      classify: async () => classifyResult("safe", 0.99),
+    });
+    const ruleGate = createGate(ruleDeps.deps);
+    const ruled = await ruleGate.decide({ tool: "bash", args: { command: "rm -rf /tmp/x" }, task: "t" });
+    expect(ruled.action).toBe("block");
+    expect(ruled.source).toBe("rule");
+
+    const secretsDeps = makeDeps({
+      config: { mode: "auto" },
+      scanSecrets: async () => ({ ruleId: "generic-api-key", secret: "sk-live-abc", masked: "sk-…(51 chars)" }),
+    });
+    const secretsGate = createGate(secretsDeps.deps);
+    const secreted = await secretsGate.decide({ tool: "write", args: { path: "/tmp/a", content: "key" }, task: "t" });
+    expect(secreted.action).toBe("block");
+    expect(secreted.source).toBe("secrets");
+  });
+
+  it("model failure still asks under failMode ask (the one exception)", async () => {
+    const { deps, asked } = makeDeps({
+      config: { mode: "auto" },
+      classify: async () => {
+        throw new Error("ECONNREFUSED");
+      },
+      askOperator: async () => "deny",
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "read", args: { path: "/tmp/a" }, task: "t" });
+    expect(asked).toHaveLength(1);
+    expect(asked[0].reason).toContain("model unavailable");
+    expect(decision.action).toBe("block");
+    expect(decision.source).toBe("fail");
+  });
+
+  it("model failure with an explicit failMode block is honored — auto never vetoes it", async () => {
+    const { deps, asked } = makeDeps({
+      config: { mode: "auto", failMode: "block" },
+      classify: async () => {
+        throw new Error("ECONNREFUSED");
+      },
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "read", args: { path: "/tmp/a" }, task: "t" });
+    expect(decision.action).toBe("block");
+    expect(decision.source).toBe("fail");
+    expect(asked).toHaveLength(0);
+  });
+
+  it("records the session id on the log record (both modes)", async () => {
+    const { deps, log } = makeDeps({
+      config: { mode: "auto" },
+      getSessionId: () => "sess-abc123",
+    });
+    const gate = createGate(deps);
+    await gate.decide({ tool: "read", args: { path: "/tmp/a" }, task: "t" });
+    expect(log[0].sessionId).toBe("sess-abc123");
+  });
+
+  it("manual (default) still asks on unsure — safe by default", async () => {
+    const { deps, asked } = makeDeps({
+      classify: async () => classifyResult("unsure", 0.9),
+      askOperator: async () => "deny",
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "read", args: { path: "/tmp/a" }, task: "t" });
+    expect(asked).toHaveLength(1);
+    expect(decision.action).toBe("block");
+    expect(decision.source).toBe("operator");
+  });
+});
+
+describe("auto mode: the threshold still governs the block side (ADR-0008)", () => {
+  it("an unsafe classification below the threshold falls to the uncertainty bucket: allows (no ask)", async () => {
+    // The sharpest consequence of auto mode (ADR-0008): the threshold only
+    // decides which `unsafe` verdicts are *confident blocks*; a weaker
+    // `unsafe` is uncertainty, and uncertainty allows here.
+    const { deps, asked } = makeDeps({
+      config: { mode: "auto", threshold: 0.95 },
+      classify: async () => classifyResult("unsafe", 0.9),
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "bash", args: { command: "rm -rf /" }, task: "t" });
+    expect(asked).toHaveLength(0);
+    expect(decision.action).toBe("allow");
+    expect(decision.source).toBe("auto");
+    expect(decision.reason).toContain("confidence 0.90 below threshold 0.95");
+  });
+
+  it("the same call in manual mode asks — the mode, not the matrix, changed", async () => {
+    const { deps, asked } = makeDeps({
+      config: { threshold: 0.95 },
+      classify: async () => classifyResult("unsafe", 0.9),
+      askOperator: async () => "deny",
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "bash", args: { command: "rm -rf /" }, task: "t" });
+    expect(asked).toHaveLength(1);
+    expect(decision.action).toBe("block");
+    expect(decision.source).toBe("operator");
+  });
+
+  it("an unsafe classification at the threshold blocks in auto mode", async () => {
+    const { deps, asked } = makeDeps({
+      config: { mode: "auto", threshold: 0.9 },
+      classify: async () => classifyResult("unsafe", 0.9),
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "bash", args: { command: "rm -rf /" }, task: "t" });
+    expect(decision.action).toBe("block");
+    expect(decision.source).toBe("model");
+    expect(asked).toHaveLength(0);
+  });
+
+  it("an invalid mode is a config error: fail-closed, never a silent manual", async () => {
+    const { deps, asked, classifyCalls } = makeDeps({
+      config: { mode: "AUTO" as unknown as "auto" },
+      askOperator: async () => "allow",
+    });
+    const gate = createGate(deps);
+    const decision = await gate.decide({ tool: "read", args: { path: "/tmp/a" }, task: "t" });
+    expect(decision.action).toBe("block");
+    expect(decision.source).toBe("fail");
+    expect(decision.reason).toContain('invalid mode "AUTO"');
+    expect(asked).toHaveLength(0);
+    expect(classifyCalls).toHaveLength(0);
+  });
+});
+
+describe("the decision log records full arguments", () => {
+  // Assembled so this fixture is not itself a credential / gate path.
+  const LEAK = ["fakecredential", "value", "1234567890"].join("");
+  const GATED = ["", "home", "op", ".pi", "agent", "gate", "config.json"].join("/");
+
+  it("logs the whole call verbatim, not the model's 100-character view", async () => {
+    const content = "x".repeat(4000);
+    const { deps, log, classifyCalls } = makeDeps({ classify: async () => classifyResult("safe", 0.98) });
+    await createGate(deps).decide({ tool: "write", args: { path: "/tmp/a", content }, task: "t" });
+    expect(log[0].args).toBe(JSON.stringify({ path: "/tmp/a", content }));
+    expect(log[0].args).not.toContain("chars)");
+    // the judge's egress window is unchanged (ADR-0002): only the audit
+    // trail widened.
+    expect(classifyCalls[0].input.args.length).toBe(100);
+  });
+
+  it("redacts a secrets hit (unchanged token)", async () => {
+    const { deps, log } = makeDeps({
+      classify: async () => classifyResult("safe", 0.98),
+      scanSecrets: async () => ({ ruleId: "generic-api-key", secret: LEAK, masked: "fak…" }),
+    });
+    await createGate(deps).decide({ tool: "write", args: { path: "/tmp/a", content: LEAK }, task: "t" });
+    expect(log[0].source).toBe("secrets");
+    expect(log[0].args).toBe("<blocked: secrets>");
+    expect(JSON.stringify(log[0])).not.toContain(LEAK);
+  });
+
+  it("redacts a protected block: self-protection runs before the secrets scan", async () => {
+    const { deps, log } = makeDeps({ classify: async () => classifyResult("safe", 0.98) });
+    await createGate(deps).decide({ tool: "write", args: { path: GATED, content: LEAK }, task: "t" });
+    expect(log[0].source).toBe("protected");
+    expect(log[0].args).toBe("<blocked: gate path>");
+    // the target is diagnosable from the reason, without un-redacting args
+    expect(log[0].reason).toContain("config.json");
+    expect(JSON.stringify(log[0])).not.toContain(LEAK);
+  });
+
+  it("redacts a protected block even when the credential sits past char 100", async () => {
+    const { deps, log } = makeDeps({ classify: async () => classifyResult("safe", 0.98) });
+    await createGate(deps).decide({
+      tool: "write",
+      args: { path: GATED, padding: "z".repeat(400), content: LEAK },
+      task: "t",
+    });
+    expect(log[0].source).toBe("protected");
+    expect(JSON.stringify(log[0])).not.toContain(LEAK);
+  });
+
+  it("keeps the operator prompt preview capped by log.truncateArgsBytes", async () => {
+    const { deps, asked } = makeDeps({
+      classify: async () => classifyResult("unsure", 0.4),
+      askOperator: async () => "deny",
+    });
+    await createGate(deps).decide({ tool: "write", args: { content: "y".repeat(6000) }, task: "t" });
+    // the cap plus the ellipsis `cap()` appends
+    expect(asked[0].argsSummary.length).toBe(DEFAULT_CONFIG.log.truncateArgsBytes + 1);
+    expect(asked[0].argsSummary.endsWith("…")).toBe(true);
+  });
+
+  it("a disabled gate logs the call verbatim — the pass-through transcript", async () => {
+    const { deps, log } = makeDeps({ config: { enabled: false }, classify: async () => classifyResult("safe", 0.98) });
+    await createGate(deps).decide({ tool: "write", args: { path: "/tmp/a", content: "plain" }, task: "t" });
+    expect(log[0].source).toBe("disabled");
+    expect(log[0].args).toBe(JSON.stringify({ path: "/tmp/a", content: "plain" }));
+  });
+});
+

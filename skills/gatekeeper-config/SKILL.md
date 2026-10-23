@@ -11,7 +11,7 @@ Two ways to configure, both operator-only: **slash commands** (below — the age
 
 ## Slash commands
 
-- `/gate` — status: endpoints, multi-endpoint mode, threshold, fail mode, rule count, log path, session stats.
+- `/gate` — status: endpoints, endpoint mode, gate mode (with the level that decided it), threshold, fail mode, rule count, log path, session stats.
   - `/gate model` — list endpoints and who the decision model (`modelSelect`) is serving.
   - `/gate model <name>` — select the endpoint `modelSelect` serves; persisted, user level (`--project` ok); unknown name → warning with the candidates.
 - `/gate:rules` — list (project `p*`, user `u*`, then shipped defaults) / `add` / `rm` / `test`:
@@ -25,14 +25,15 @@ Two ways to configure, both operator-only: **slash commands** (below — the age
   - `multiEndpointMode` — `modelSelect` (default) | `jury` | `fallback` (ADR-0007); invalid value is a config error, never a silent default
   - `selectedEndpoint` — endpoint `modelSelect` serves (`/gate model <name>` is the friendlier path)
   - `notify` — `always` (default) | `summary` (blocks/asks only) | `off` | `debug` (also dumps the full model request/answer per classification); decision log unaffected
+  - `mode` — `manual` (default) | `auto` (ADR-0008): auto voids the ask side — unsure, below-threshold safe, bound-exceeded safe, and below-threshold unsafe all allow without asking; unsafe at or above the threshold, deny rules, secrets hits, and self-protection still block, and model failure still routes by `failMode`. The threshold still draws the block line, so raising it widens the auto-allow set. Defaults to `manual` — never auto implicitly; an invalid value is a config error
   - `secrets.enabled/.autoUpdate/.source` — secrets engine
-  - `log.level/.maxLines/.keepFiles/.retentionDays` — decision log
+  - `log.level/.maxLines/.keepFiles/.retentionDays` — decision log; `log.columns` — the log view's visible columns (comma-separated registry names; the view's column selector writes it at user level)
   - `test bash '{"command":"ls /tmp"}'` — fan the sample out to every endpoint, verdicts side by side
   - `endpoint.apiKey` is settable; the echo is redacted (`***`)
 - `/gate:secrets` — status (rules active, source, last update), `update` (force refresh), `test "<text>"` (matching rule, masked). False positive → operator adds `[[allow]]` (rule id + optional `path`) in `~/.pi/agent/gate/secrets.toml`; never weaken the rules.
-- `/gate:log [n] [tool]` — tail recent decisions, e.g. `/gate:log 50 bash`.
+- `/gate:log [n] [tool] [session <prefix>]` — tail recent decisions, e.g. `/gate:log 50 bash`; `session <prefix>` filters to the pi session whose id starts with the prefix (ambiguous prefix → the candidates are listed), e.g. `/gate:log 50 session abc12`. In the TUI, `c` opens a column selector: ↑↓ move, x/space toggle, Esc back — changes are kept and persisted (user level).
 
-When the user asks why a call was gated: point them to the session's transparency line and `/gate:log` — classification, confidence, and reason (below-threshold, unsafe-probability bound, deny rule, or model failure).
+When the user asks why a call was gated: point them to the session's transparency line and `/gate:log` — classification, confidence, and reason (below-threshold, unsafe-probability bound, deny rule, or model failure). Auto-allowed uncertainty shows source `auto` in the log; `operator` always means a human decided.
 
 ## Manual configuration
 

@@ -41,12 +41,16 @@ How concentrated the model's probabilities are, from 0 to 1. Not the probability
 _Avoid_: probability, score
 
 **Threshold**:
-The minimum confidence at which a `safe` or `unsafe` classification acts autonomously; below it, the call goes to the operator. Auto-allow additionally requires a negligible `unsafe` probability (a fixed bound, ≤ 0.1).
+The minimum confidence at which a `safe` or `unsafe` classification acts autonomously; below it, the call goes to the operator (auto mode: allows instead). Auto-allow additionally requires a negligible `unsafe` probability (a fixed bound, ≤ 0.1; void in auto mode). In auto mode the threshold still draws the confident-block line — an `unsafe` below it is uncertainty and allows.
 _Avoid_: cutoff
 
 **Decision**:
 The final action on a call: allow, block, or ask.
 _Avoid_: verdict, outcome
+
+**Auto mode**:
+The `mode: "auto"` posture (ADR-0008): the ask side of the matrix is void — `unsure`, below-threshold `safe`, bound-exceeded `safe`, and below-threshold `unsafe` allow instead of asking. Deterministic layers and an `unsafe` verdict at or above the threshold still block, and model failure stays on `failMode`. Defaults to `manual`.
+_Avoid_: yolo mode, unattended mode, headless mode
 
 **Operator**:
 The human who approves or denies a call at the ask step.

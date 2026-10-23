@@ -221,25 +221,30 @@ export function gateDirs(home: string, cwd?: string): string[] {
  *  overridable by none of them — an agent cannot neuter the gate through
  *  the gate. Every compared path is realpath'd best-effort, so a symlink
  *  chain into the gate dir is caught; realpath of a not-yet-existing
- *  target (a write creating a file) falls back to the lexical path. */
+ *  target (a write creating a file) falls back to the lexical path.
+ *
+ *  Returns the offending path, or undefined for a clean call — never the
+ *  call's arguments, since a protected block is exactly where a credential
+ *  may sit. A shell hit reports the gate directory rather than the
+ *  matching token, so no command fragment can ride along. */
 export async function touchesGatePaths(
   tool: string,
   args: Record<string, unknown>,
   home: string,
   cwd?: string,
-): Promise<boolean> {
+): Promise<string | undefined> {
   const dirs = await Promise.all(gateDirs(home, cwd).map(real));
   if (FILE_TOOLS.has(tool)) {
     const raw = typeof args?.path === "string" ? expandHome(args.path, home) : undefined;
-    if (raw === undefined) return false;
+    if (raw === undefined) return undefined;
     const target = normalize(raw);
     // Resolve relative targets against the cwd before comparing with the
     // absolute gate dirs; a relative spelling that cannot resolve to one
     // (no cwd, or a dot-detour) still hits the literal gate-dir prefixes.
     const resolved = isAbsolute(target) ? target : cwd ? normalize(join(cwd, target)) : target;
     const realTarget = await real(resolved);
-    if (dirs.some((d) => realTarget === d || realTarget.startsWith(`${d}/`))) return true;
-    return [".pi/gate", ".pi/agent/gate"].some((p) => target === p || target.startsWith(`${p}/`));
+    if (dirs.some((d) => realTarget === d || realTarget.startsWith(`${d}/`))) return realTarget;
+    return [".pi/gate", ".pi/agent/gate"].some((p) => target === p || target.startsWith(`${p}/`)) ? target : undefined;
   }
   const raw = expandHome(argsText(tool, args), home)
     .replace(/\$\{HOME\}/g, home)
@@ -251,7 +256,8 @@ export async function touchesGatePaths(
     .map((t) => (t.includes("/") && t.includes("..") ? normalize(t) : t))
     .join("");
   const needles = [...dirs.flatMap((d) => [`${d}/`, `${d} `]), ".pi/gate/", ".pi/agent/gate/"];
-  if (needles.some((n) => raw.includes(n) || normalized.includes(n))) return true;
+  const hit = needles.find((n) => raw.includes(n) || normalized.includes(n));
+  if (hit) return hit.trim();
   // Symlink chains: realpath each path-shaped token (relative ones
   // resolve against the cwd) and flag any that lands inside a gate dir.
   const tokenTargets = raw
@@ -263,7 +269,8 @@ export async function touchesGatePaths(
       return isAbsolute(n) ? n : cwd ? join(cwd, n) : n;
     });
   const reals = await Promise.all(tokenTargets.map(real));
-  if (reals.some((r) => dirs.some((d) => r === d || r.startsWith(`${d}/`)))) return true;
+  const symlinked = reals.findIndex((r) => dirs.some((d) => r === d || r.startsWith(`${d}/`)));
+  if (symlinked !== -1) return tokenTargets[symlinked]!;
   // `cd` chains: track the virtual cwd across components and flag any cd
   // that lands inside a gate directory. Each relative cd resolves against
   // the previous cd's target, not the original cwd. Variables and dynamic
@@ -283,10 +290,10 @@ export async function touchesGatePaths(
     } else {
       next = target;
     }
-    if (next && dirs.some((d) => next === d || next.startsWith(`${d}/`))) return true;
+    if (next && dirs.some((d) => next === d || next.startsWith(`${d}/`))) return next;
     virtualCwd = next;
   }
-  return false;
+  return undefined;
 }
 
 /** Best-effort realpath: resolves symlinks where the path exists, and

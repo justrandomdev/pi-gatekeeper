@@ -8,7 +8,7 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { configPaths, DEFAULT_CONFIG, MULTI_ENDPOINT_MODES, resolveConfig, resolveEndpoints, resolveMode, selectEndpoint, type DeepPartial, type EndpointConfig, type GatekeeperConfig, type NamedEndpoint, type ScopedConfig } from "../src/config.js";
+import { configPaths, DEFAULT_CONFIG, GATE_MODES, LOG_COLUMNS, MULTI_ENDPOINT_MODES, resolveConfig, resolveEndpoints, resolveGateMode, resolveMode, selectEndpoint, type DeepPartial, type EndpointConfig, type GatekeeperConfig, type LogColumn, type LogConfig, type NamedEndpoint, type ScopedConfig } from "../src/config.js";
 import { createSystemOneClassifier, type ClassifyInput } from "../src/classifier.js";
 import { createGate, type GateDeps, type OperatorPromptInfo } from "../src/decision.js";
 import { DecisionLog } from "../src/log.js";
@@ -49,8 +49,22 @@ const isOneOf = (...options: string[]) =>
   (value: unknown): string | undefined =>
     options.includes(value as string) ? undefined : `must be one of ${options.map((o) => `"${o}"`).join(", ")}`;
 
+/** `log.columns`: parse a comma-separated list of registry names
+ *  (ADR-0008); undefined when anything is unparseable. */
+function parseColumns(value: unknown): LogColumn[] | undefined {
+  if (typeof value !== "string") return undefined;
+  const names = value.split(",").map((c) => c.trim()).filter(Boolean);
+  if (!names.length) return undefined;
+  const valid = names.every((c) => (LOG_COLUMNS as readonly string[]).includes(c));
+  return valid ? (names as LogColumn[]) : undefined;
+}
+
+const isColumnList = (value: unknown): string | undefined =>
+  parseColumns(value) ? undefined : `must be a comma-separated list from: ${LOG_COLUMNS.join(", ")}`;
+
 const CONFIG_KEYS: Record<string, (value: unknown) => string | undefined> = {
   enabled: isBoolean,
+  mode: isOneOf(...GATE_MODES),
   threshold: isPortion,
   policy: isNonEmptyString,
   failMode: isOneOf("ask", "block"),
@@ -71,6 +85,7 @@ const CONFIG_KEYS: Record<string, (value: unknown) => string | undefined> = {
   "log.keepFiles": isNonNegativeInt,
   "log.retentionDays": isPositiveInt,
   "log.truncateArgsBytes": isPositiveInt,
+  "log.columns": isColumnList,
 };
 
 export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = {}): Promise<void> {
@@ -80,8 +95,11 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
   let currentTask = "";
   let currentCtx: AnyCtx | undefined;
   let effective: GatekeeperConfig = resolveConfig({});
+  let scopedConfig: ScopedConfig = {};
+  let configNotice: string | undefined;
+  let lastConfigNotice: string | undefined;
   const mtimeCache = new Map<string, number | undefined>();
-  const stats = { allowed: 0, blocked: 0, asked: 0 };
+  const stats = { allowed: 0, blocked: 0, asked: 0, autoAllowed: 0 };
 
   function userConfigPath(): string {
     return configPaths(home, "").user;
@@ -94,11 +112,17 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
     const scoped: ScopedConfig = {};
     const candidates: [keyof ScopedConfig, string][] = [["user", userConfigPath()]];
     if (trusted) candidates.push(["project", projectConfigPath(cwd)]);
+    configNotice = undefined;
     for (const [key, path] of candidates) {
       try {
         scoped[key] = JSON.parse(await readFile(path, "utf8")) as Partial<GatekeeperConfig>;
-      } catch {
-        // absent or malformed: skip the level
+      } catch (error) {
+        // Absent is normal; malformed is not — the level silently falls
+        // back to the defaults, so say so (a corrupt `failMode: block`
+        // file must never look like an ordinary config).
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          configNotice = `gate › config unreadable at ${key} level: ${(error as Error).message}; that level's keys fall back to defaults`;
+        }
       }
     }
     return scoped;
@@ -123,7 +147,12 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
       }
     }
     if (changed) {
-      effective = resolveConfig(await readScoped(ctx.isProjectTrusted(), ctx.cwd));
+      scopedConfig = await readScoped(ctx.isProjectTrusted(), ctx.cwd);
+      effective = resolveConfig(scopedConfig);
+      if (configNotice && configNotice !== lastConfigNotice) {
+        ctx.ui.notify(configNotice, "warning");
+      }
+      lastConfigNotice = configNotice;
     }
   }
 
@@ -141,6 +170,21 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
       if (mode === "fallback") return "fallback › first-hit";
       const { endpoint, warning } = selectEndpoint(endpoints, config);
       return `modelSelect › ${endpoint.name}${warning ? ` (selected "${config.selectedEndpoint}" not found)` : ""}`;
+    } catch (error) {
+      return (error as Error).message;
+    }
+  }
+
+  /** The gate's posture for /gate status (ADR-0008), naming the level that
+   *  decided it: "the posture the operator believes in must be the posture
+   *  that runs", and a trusted repo can set `mode` too. An invalid value is
+   *  reported, never silently read as manual. */
+  function gateModeLine(config: GatekeeperConfig): string {
+    const level = scopedConfig.project?.mode !== undefined
+      ? "project"
+      : scopedConfig.user?.mode !== undefined ? "user" : "default";
+    try {
+      return `${resolveGateMode(config)} (${level})`;
     } catch (error) {
       return (error as Error).message;
     }
@@ -398,10 +442,33 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
     };
   }
 
+  /** Merge one patch into a scoped level's `log` object (defaults first),
+   *  so every log key write goes through one shape. */
+  function withLog(scoped: DeepPartial<GatekeeperConfig>, patch: Partial<LogConfig>): void {
+    scoped.log = { ...DEFAULT_CONFIG.log, ...(scoped.log ?? {}), ...patch };
+  }
+
+  /** Writes are serialized through this chain: the column selector fires
+   *  them un-awaited, one per toggle, and an interleaved read-modify-write
+   *  would truncate the file mid-JSON (ADR-0008). Same shape as
+   *  runUpdate's single-flight guard. */
+  let writeQueue: Promise<void> = Promise.resolve();
+
   /** Write a scoped config file, creating it if needed. Project-level writes
    *  require trust; user-level writes don't. The ctx is supplied so the gate
    *  can check it (and report blocks) where the caller's ctx isn't available. */
-  async function writeScoped(
+  function writeScoped(
+    level: "user" | "project",
+    mutate: (scoped: DeepPartial<GatekeeperConfig>) => void,
+    cwd: string,
+    ctx: AnyCtx | undefined,
+  ): Promise<void> {
+    const run = writeQueue.then(() => writeScopedNow(level, mutate, cwd, ctx));
+    writeQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  async function writeScopedNow(
     level: "user" | "project",
     mutate: (scoped: DeepPartial<GatekeeperConfig>) => void,
     cwd: string,
@@ -428,7 +495,8 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
     // when supplied, else the session's) — `currentCtx` alone may be
     // undefined, which would drop a just-written project config from
     // `effective` until the next refresh.
-    effective = resolveConfig(await readScoped(trusted, cwd));
+    scopedConfig = await readScoped(trusted, cwd);
+    effective = resolveConfig(scopedConfig);
   }
 
   // Load the secrets engine and run the background auto-update (ADR-0004).
@@ -457,6 +525,7 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
         },
       }).classify(input),
     askOperator,
+    getSessionId: () => currentCtx?.sessionManager.getSessionId(),
     notify: (line) => {
       currentCtx?.ui.notify(line, line.includes("blocked") ? "warning" : "info");
     },
@@ -503,6 +572,7 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
     });
     if (decision.action === "allow") {
       stats.allowed++;
+      if (decision.source === "auto") stats.autoAllowed++;
     } else {
       stats.blocked++;
       return { block: true, reason: decision.reason };
@@ -564,11 +634,12 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
         `Endpoints: ${endpoints.map((e) => `${e.name} @ ${e.url}`).join(", ")}`,
         // The multi-endpoint act (ADR-0007) — only meaningful with an
         // `endpoints` array; a single-endpoint config has no mode line.
-        ...(effective.endpoints?.length ? [`Mode: ${modeLine(effective, endpoints)}`] : []),
+        ...(effective.endpoints?.length ? [`Endpoint mode: ${modeLine(effective, endpoints)}`] : []),
         `Threshold: ${effective.threshold} | Fail mode: ${effective.failMode}`,
+        `Gate mode: ${gateModeLine(effective)}`,
         `Secrets: ${effective.secrets.enabled ? secretsLine : "off"}`,
         `Rules: ${effective.rules.length} (incl. shipped defaults) | Log: ${logDir(ctx.cwd)}`,
-        `Session: ${stats.allowed} allowed, ${stats.blocked} blocked, ${stats.asked} asked`,
+        `Session: ${stats.allowed} allowed, ${stats.blocked} blocked, ${stats.asked} asked, ${stats.autoAllowed} auto-allowed`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     },
@@ -771,15 +842,22 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
           ctx.ui.notify(`gate › unknown key "${key}" — valid keys: ${Object.keys(CONFIG_KEYS).join(", ")}`, "warning");
           return;
         }
+        // A view preference of the human, not a repo posture (ADR-0008):
+        // user level only, so a project cannot reshape the operator's view.
+        if (key === "log.columns" && level === "project") {
+          ctx.ui.notify("gate › log.columns is user-level only (drop --project)", "warning");
+          return;
+        }
         const parse = (): unknown => {
           if (value === "true" || value === "false") return value === "true";
           if (
             key === "threshold" || key === "stateBudgetChars" || key === "endpoint.timeoutMs" ||
-            (key.startsWith("log.") && key !== "log.level")
+            (key.startsWith("log.") && key !== "log.level" && key !== "log.columns")
           ) return Number(value);
           if (
             key === "policy" || key === "failMode" || key === "log.level" ||
             key === "multiEndpointMode" || key === "selectedEndpoint" ||
+            key === "mode" || key === "log.columns" ||
             key.startsWith("endpoint.")
           ) return value;
           return Number.isNaN(Number(value)) ? value : Number(value);
@@ -792,9 +870,12 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
         }
         await writeScoped(level, (scoped) => {
           if (key === "log.level") {
-            scoped.log = { ...DEFAULT_CONFIG.log, ...(scoped.log ?? {}), level: value as "user" | "project" };
+            withLog(scoped, { level: value as "user" | "project" });
+          } else if (key === "log.columns") {
+            const columns = parseColumns(value);
+            if (columns) withLog(scoped, { columns });
           } else if (key.startsWith("log.")) {
-            scoped.log = { ...DEFAULT_CONFIG.log, ...(scoped.log ?? {}), [key.slice("log.".length)]: parsed as number };
+            withLog(scoped, { [key.slice("log.".length)]: parsed as number } as Partial<LogConfig>);
           } else if (key.startsWith("endpoint.")) {
             scoped.endpoint = {
               ...DEFAULT_CONFIG.endpoint,
@@ -823,7 +904,7 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
       ctx.ui.notify(
         [
           `gate › effective config (defaults < user < project):`,
-          `enabled: ${effective.enabled}`,
+          `enabled: ${effective.enabled} | mode: ${gateModeLine(effective)}`,
           `threshold: ${effective.threshold}`,
           ...(effective.endpoints?.length
             ? effective.endpoints.map((e, i) => `endpoint ${i + 1}: ${e.name ?? e.model} @ ${e.url} (${e.model})`)
@@ -832,6 +913,7 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
           `multiEndpointMode: ${effective.multiEndpointMode ?? "modelSelect (default)"} | selectedEndpoint: ${effective.selectedEndpoint ?? "(none — first entry)"}`,
           `secrets: ${effective.secrets.enabled ? "enabled" : "off"} | autoUpdate: ${effective.secrets.autoUpdate}`,
           `log: level=${effective.log.level} maxLines=${effective.log.maxLines} keepFiles=${effective.log.keepFiles} retentionDays=${effective.log.retentionDays}`,
+          `log.columns: ${effective.log.columns ? effective.log.columns.join(",") : "default"}`,
           `secrets source: ${effective.secrets.source}`,
         ].join("\n"),
         "info",
@@ -840,17 +922,67 @@ export function createGatekeeper(pi: ExtensionAPI, options: GatekeeperOptions = 
   });
 
   pi.registerCommand("gate:log", {
-    description: "Tail the decision log: [n] [tool filter]",
+    description: "Tail the decision log: [n] [tool filter] [session <id-prefix>]",
     handler: async (args: string, ctx: AnyCtx) => {
       await refreshConfig(ctx);
       const parts = args.trim().split(/\s+/).filter(Boolean);
+      // `session <prefix>` composes with the existing [n] [toolfilter].
+      let sessionPrefix: string | undefined;
+      const sessionAt = parts.indexOf("session");
+      if (sessionAt !== -1) {
+        sessionPrefix = parts[sessionAt + 1];
+        if (!sessionPrefix) {
+          ctx.ui.notify("gate › session filter needs an id prefix", "warning");
+          return;
+        }
+        // Prefixes are matched against the raw JSONL line, so keep them to
+        // characters a session id can hold.
+        if (!/^[A-Za-z0-9_-]+$/.test(sessionPrefix)) {
+          ctx.ui.notify(`gate › "${sessionPrefix}" is not a session id prefix`, "warning");
+          return;
+        }
+        parts.splice(sessionAt, 2);
+      }
       const n = parts[0] && /^\d+$/.test(parts[0]) ? Number(parts[0]) : 20;
       const filter = parts[0] && /^\d+$/.test(parts[0]) ? parts[1] : parts[0];
-      const records = await logger(ctx.cwd).tail(n * 4);
-      const selected = records.filter((r) => !filter || r.tool.includes(filter)).slice(-n);
+      // A session filter scans the whole log by substring (ADR-0008) without
+      // parsing records it does not return; otherwise keep the tail window.
+      const sessionRecords = sessionPrefix
+        ? await logger(ctx.cwd).tailWhere((line) => line.includes(`"sessionId":"${sessionPrefix}`), Number.MAX_SAFE_INTEGER)
+        : [];
+      const records = sessionPrefix ? sessionRecords : await logger(ctx.cwd).tail(n * 4);
+      let selected = records.filter((r) => !filter || r.tool.includes(filter));
+      if (sessionPrefix) {
+        // Ambiguity is judged on the prefix matches themselves, before the
+        // tool filter, so a filter cannot hide a second session.
+        const ids = [...new Set(sessionRecords.map((r) => r.sessionId).filter((id): id is string => !!id))];
+        if (ids.length > 1) {
+          ctx.ui.notify(
+            [`gate › session prefix "${sessionPrefix}" is ambiguous — ${ids.length} sessions match:`, ...ids].join("\n"),
+            "warning",
+          );
+          return;
+        }
+        if (ids.length === 0) {
+          ctx.ui.notify(`gate › no session matching "${sessionPrefix}" in the log`, "warning");
+          return;
+        }
+      }
+      selected = n > 0 ? selected.slice(-n) : [];
       if (ctx.mode === "tui" && typeof ctx.ui.custom === "function" && selected.length) {
         await ctx.ui.custom<void>(
-          (tui, theme, _kb, done) => new GateLogView(tui, theme, selected, done, { n, filter }),
+          (tui, theme, _kb, done) =>
+            new GateLogView(tui, theme, selected, done, {
+              n,
+              filter,
+              session: sessionPrefix,
+              columns: effective.log.columns,
+              persistColumns: (columns) => {
+                void writeScoped("user", (scoped) => withLog(scoped, { columns }), ctx.cwd, ctx).catch((error: Error) =>
+                  ctx.ui.notify(`gate › could not save log columns: ${error.message}`, "warning"),
+                );
+              },
+            }),
           { overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } },
         );
         return;

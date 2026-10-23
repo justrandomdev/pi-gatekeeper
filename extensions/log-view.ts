@@ -8,6 +8,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { LogRecord } from "../src/decision.js";
+import { DEFAULT_LOG_COLUMNS, LOG_COLUMNS, type LogColumn } from "../src/config.js";
 
 export type LogEntry = LogRecord & { ts: string };
 
@@ -16,10 +17,39 @@ export interface LogViewOptions {
   n: number;
   /** Tool filter as typed by the operator (for the title). */
   filter?: string;
+  /** Session-id prefix filter (for the title, ADR-0008). */
+  session?: string;
+  /** The persisted `log.columns` set; absent → the default view. */
+  columns?: LogColumn[];
+  /** Persist a new visible set (user level, ADR-0008), fired on each
+   *  toggle. */
+  persistColumns?: (columns: LogColumn[]) => void;
 }
 
 const ACTION_COLORS = { allow: "success", block: "error" } as const;
 const CHOICE_COLORS = { safe: "success", unsafe: "error", unsure: "warning", unavailable: "error" } as const;
+
+/** The column registry is config-shaped (src/config.ts); this module owns
+ *  only how a column renders. */
+const COL_CAPS: Record<Exclude<LogColumn, "args" | "reason">, number> = {
+  time: 8,
+  tool: 12,
+  action: 6,
+  source: 9,
+  class: 13,
+  model: 16,
+  session: 10,
+};
+const FLEXIBLE: readonly string[] = ["args", "reason"];
+
+/** The configured column set in registry order. Deliberately lenient,
+ *  unlike `mode` (which throws): a column name is cosmetic — an unknown
+ *  one is dropped and an unresolvable set falls back to the default
+ *  view, which is always a usable table. */
+function resolveColumns(configured?: LogColumn[]): LogColumn[] {
+  const visible = configured?.length ? LOG_COLUMNS.filter((c) => configured.includes(c)) : [];
+  return visible.length ? visible : [...DEFAULT_LOG_COLUMNS];
+}
 
 /** Model column: the serving endpoint, all jury/fallback member names, or —. */
 export function modelName(r: LogEntry): string {
@@ -28,15 +58,19 @@ export function modelName(r: LogEntry): string {
   return "—";
 }
 
-/** Fixed caps for the leading columns; args/reason split what's left 40/60. */
-const COL_HEADERS = ["time", "tool", "action", "source", "class", "model"] as const;
-const COL_MAX = [8, 12, 6, 9, 13, 16];
-
 export class GateLogView implements Component {
   private selected = 0;
   private detail = false;
   private scrollTop = 0;
   private cache: { width: number; lines: string[] } | undefined;
+  private visible: LogColumn[];
+  private menu = false;
+  private menuIndex = 0;
+  private menuTop = 0;
+  /** The content width the last render wrapped at. The detail scroll clamp
+   *  must use the same width, or it computes a short `maxTop` and the tail
+   *  of a long record is unreachable. */
+  private innerWidth = 0;
 
   constructor(
     private readonly tui: TUI,
@@ -44,13 +78,29 @@ export class GateLogView implements Component {
     private readonly records: LogEntry[],
     private readonly done: () => void,
     private readonly opts: LogViewOptions,
-  ) {}
+  ) {
+    this.visible = resolveColumns(opts.columns);
+  }
 
   invalidate(): void {
     this.cache = undefined;
   }
 
   handleInput(data: string): void {
+    if (this.menu) {
+      if (matchesKey(data, Key.escape) || data === "q") {
+        this.menu = false;
+      } else if (matchesKey(data, Key.up) || data === "k") {
+        this.menuIndex = Math.max(0, this.menuIndex - 1);
+      } else if (matchesKey(data, Key.down) || data === "j") {
+        this.menuIndex = Math.min(LOG_COLUMNS.length - 1, this.menuIndex + 1);
+      } else if (data === "x" || data === " ") {
+        this.toggleColumn(LOG_COLUMNS[this.menuIndex]!);
+      }
+      this.invalidate();
+      this.tui.requestRender();
+      return;
+    }
     if (data === "q") {
       this.done();
       return;
@@ -77,7 +127,11 @@ export class GateLogView implements Component {
       else if (matchesKey(data, Key.down) || data === "j") this.moveSelection(1);
       else if (matchesKey(data, Key.pageUp)) this.moveSelection(-height);
       else if (matchesKey(data, Key.pageDown)) this.moveSelection(height);
-      else if (matchesKey(data, Key.enter)) {
+      else if (data === "c") {
+        this.menu = true;
+        this.menuIndex = 0;
+        this.menuTop = 0;
+      } else if (matchesKey(data, Key.enter)) {
         this.detail = true;
         this.scrollTop = 0;
       }
@@ -91,7 +145,8 @@ export class GateLogView implements Component {
     if (this.cache?.width === width) return this.cache.lines;
     const outer = this.outerWidth(width);
     const inner = outer - 4; // "│ " + content + " │"
-    const body = this.detail ? this.detailBody(inner) : this.table(inner);
+    this.innerWidth = inner;
+    const body = this.menu ? this.menuBody(inner) : this.detail ? this.detailBody(inner) : this.table(inner);
     const lines = [
       borderTop(this.title(), outer, this.theme),
       blankRow(outer, this.theme),
@@ -106,9 +161,14 @@ export class GateLogView implements Component {
   // Table mode ---------------------------------------------------------------
 
   private table(inner: number): string[] {
-    const widths = columnWidths(this.records.map((r) => this.rowCells(r)), inner);
+    // Build every row once, clipped to the content width: a full-size args
+    // value can run to hundreds of KB, and nothing wider than `inner` can
+    // ever be shown. Without the clip the table re-handles megabytes of
+    // string per frame, which is visible as stutter once records get big.
+    const cellsByRecord = this.records.map((r) => this.rowCells(r, inner));
+    const widths = columnWidths(this.visible, cellsByRecord, inner);
 
-    const header = [...COL_HEADERS, "args", "reason"].map((h, i) => h.padEnd(widths[i]));
+    const header = this.visible.map((h, i) => h.padEnd(widths[i]!));
     const ruleLines: string[] = [
       truncateToWidth(this.theme.fg("muted", this.theme.bold(header.join(" "))), inner),
       this.theme.fg("border", "─".repeat(inner)),
@@ -119,8 +179,8 @@ export class GateLogView implements Component {
 
     const rows: string[] = [];
     for (let i = this.scrollTop; i < Math.min(this.records.length, this.scrollTop + height); i++) {
-      const cells = this.rowCells(this.records[i]!);
-      const text = cells.map((c, j) => c.padEnd(widths[j])).join(" ");
+      const cells = cellsByRecord[i]!;
+      const text = cells.map((c, j) => c.padEnd(widths[j]!)).join(" ");
       const line = i === this.selected
         ? this.theme.bg("selectedBg", text + trailingPad(text, inner))
         : this.colorRow(cells, widths, this.records[i]!);
@@ -130,32 +190,68 @@ export class GateLogView implements Component {
   }
 
   private colorRow(cells: string[], widths: number[], record: LogEntry): string {
-    return cells.map((c, j) => this.color(j, record, c.padEnd(widths[j]))).join(" ");
+    return this.visible.map((c, j) => this.color(c, record, cells[j]!.padEnd(widths[j]!))).join(" ");
   }
 
-  private color(column: number, record: LogEntry, text: string): string {
+  private color(column: LogColumn, record: LogEntry, text: string): string {
+    if (column === "time" || column === "source") return this.theme.fg("dim", text);
+    if (column === "action") return this.theme.fg(ACTION_COLORS[record.action] ?? "text", text);
+    return text;
+  }
+
+  private rowCells(r: LogEntry, max: number): string[] {
+    return this.visible.map((c) => this.cell(r, c, max));
+  }
+
+  /** One cell, clipped to `max` characters — enough for any column width,
+   *  so the clip is never visible. */
+  private cell(r: LogEntry, column: LogColumn, max: number): string {
+    const clip = (text: string) => (text.length <= max ? text : text.slice(0, max));
+    const cls = r.classification ? `${r.classification} ${(r.confidence ?? 0).toFixed(2)}` : "—";
     switch (column) {
-      case 0:
-        return this.theme.fg("dim", text);
-      case 2:
-        return this.theme.fg(ACTION_COLORS[record.action] ?? "text", text);
-      case 3:
-        return this.theme.fg("dim", text);
-      default:
-        return text;
+      case "time": return r.ts.slice(11, 19);
+      case "tool": return r.tool;
+      case "action": return r.action;
+      case "source": return r.source;
+      case "class": return cls;
+      case "model": return modelName(r);
+      case "session": return (r.sessionId ?? "—").slice(0, COL_CAPS.session);
+      case "args": return clip(r.args ?? "");
+      case "reason": return clip(r.reason ?? "—");
     }
   }
 
-  private rowCells(r: LogEntry): string[] {
-    const cls = r.classification ? `${r.classification} ${(r.confidence ?? 0).toFixed(2)}` : "—";
-    return [r.ts.slice(11, 19), r.tool, r.action, r.source, cls, modelName(r), r.args ?? "", r.reason ?? "—"];
+  /** The column selector: a vertical registry menu, toggled in place.
+   *  Scrolled to the body height so a short terminal can still reach
+   *  every column. */
+  private menuBody(inner: number): string[] {
+    const height = Math.max(1, this.contentHeight());
+    this.menuTop = makeVisible(this.menuTop, this.menuIndex, height, LOG_COLUMNS.length);
+    return LOG_COLUMNS.slice(this.menuTop, this.menuTop + height).map((c, j) => {
+      const row = `${this.visible.includes(c) ? "[x]" : "[ ]"} ${c}`;
+      const line = this.menuTop + j === this.menuIndex ? this.theme.bg("selectedBg", row + trailingPad(row, inner)) : row;
+      return truncateToWidth(line, inner);
+    });
+  }
+
+  private toggleColumn(column: LogColumn): void {
+    const next = this.visible.includes(column)
+      ? this.visible.filter((c) => c !== column)
+      : LOG_COLUMNS.filter((c) => this.visible.includes(c) || c === column);
+    if (!next.length) return;
+    this.visible = next;
+    this.opts.persistColumns?.(next);
   }
 
   // Detail mode ---------------------------------------------------------------
 
   private scrollDetail(data: string): void {
     const viewport = this.detailViewport();
-    const lines = this.detailLines(this.outerWidth(this.tui.terminal.columns) - 4);
+    // Wrap at the width the last render used: the overlay is narrower than
+    // the terminal, and clamping against the terminal width under-counts the
+    // wrapped lines, leaving the end of a long record unreachable.
+    const inner = this.innerWidth || this.outerWidth(this.tui.terminal.columns) - 4;
+    const lines = this.detailLines(inner);
     const maxTop = Math.max(0, lines.length - viewport);
     if (matchesKey(data, Key.up) || data === "k") this.scrollTop = Math.max(0, this.scrollTop - 1);
     else if (matchesKey(data, Key.down) || data === "j") this.scrollTop = Math.min(maxTop, this.scrollTop + 1);
@@ -182,6 +278,9 @@ export class GateLogView implements Component {
     section("tool", r.tool);
     section("action", r.action, (s) => this.theme.fg(ACTION_COLORS[r.action] ?? "text", s));
     section("source", r.source, (s) => this.theme.fg("dim", s));
+    if (r.sessionId) {
+      section("session", r.sessionId);
+    }
     if (r.classification) {
       section("class", `${r.classification} ${(r.confidence ?? 0).toFixed(2)}`);
     }
@@ -244,11 +343,17 @@ export class GateLogView implements Component {
 
   private title(): string {
     const filter = this.opts.filter ? ` [${this.opts.filter}]` : "";
-    return `gate › last ${this.records.length} decision${this.records.length === 1 ? "" : "s"}${filter}`;
+    const session = this.opts.session ? ` [session ${this.opts.session}]` : "";
+    return `gate › last ${this.records.length} decision${this.records.length === 1 ? "" : "s"}${filter}${session}`;
   }
 
   private hints(): string {
-    return this.detail ? "↑↓ scroll · Enter/Esc back · q close" : "↑↓ select · Enter detail · Esc/q close";
+    if (this.menu) {
+      return this.visible.length === 1
+        ? "↑↓ move · x/space toggle · keep at least one · Esc back"
+        : "↑↓ move · x/space toggle · Esc back";
+    }
+    return this.detail ? "↑↓ scroll · Enter/Esc back · q close" : "↑↓ select · Enter detail · c columns · Esc/q close";
   }
 }
 
@@ -262,16 +367,23 @@ function makeVisible(top: number, selected: number, height: number, count: numbe
   return bounded;
 }
 
-/** Content-driven widths for the six capped columns; args/reason share the rest 40/60. */
-function columnWidths(rows: string[][], inner: number): number[] {
-  const fixed = COL_HEADERS.map((h, i) => {
+/** Content-driven widths for the visible fixed columns; args/reason
+ *  (whichever are visible) share the rest 40/60. */
+function columnWidths(visible: LogColumn[], rows: string[][], inner: number): number[] {
+  const fixedCols = visible.filter((c): c is Exclude<LogColumn, "args" | "reason"> => !FLEXIBLE.includes(c));
+  const fixed = new Map<LogColumn, number>(fixedCols.map((c) => {
+    const i = visible.indexOf(c);
     const longest = Math.max(0, ...rows.map((r) => r[i]?.length ?? 0));
-    return Math.max(h.length, Math.min(longest, COL_MAX[i]));
-  });
-  const used = fixed.reduce((a, b) => a + b, 0) + (COL_HEADERS.length - 1) + 2; // separators + padding
+    return [c, Math.max(c.length, Math.min(longest, COL_CAPS[c]))] as const;
+  }));
+  const used = [...fixed.values()].reduce((a, b) => a + b, 0) + visible.length - 1 + 2; // separators + padding
   const remaining = Math.max(12, inner - used);
-  const argsW = Math.min(Math.max(6, Math.floor(remaining * 0.4)), 60);
-  return [...fixed, argsW, Math.max(6, remaining - argsW)];
+  const hasArgs = visible.includes("args");
+  const hasReason = visible.includes("reason");
+  const argsW = hasArgs && hasReason ? Math.min(Math.max(6, Math.floor(remaining * 0.4)), 60) : hasArgs ? remaining : 0;
+  const reasonW = hasReason ? Math.max(6, remaining - argsW) : 0;
+  const flexible = new Map([["args", argsW], ["reason", reasonW]]);
+  return visible.map((c) => fixed.get(c) ?? flexible.get(c) ?? 0);
 }
 
 function trailingPad(text: string, inner: number): string {

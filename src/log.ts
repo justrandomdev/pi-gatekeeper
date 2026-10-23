@@ -94,8 +94,7 @@ export class DecisionLog {
   }
 
   /** Most recent n decisions, newest last, across rotations. */
-  async tail(n: number): Promise<(LogRecord & { ts: string })[]> {
-    const collected: (LogRecord & { ts: string })[] = [];
+  async tail(n: number): Promise<(LogRecord & { ts: string })[]> {    const collected: (LogRecord & { ts: string })[] = [];
     for (let i = this.opts.keepFiles; i >= 1 && collected.length < n; i--) {
       const rotated = join(this.opts.dir, `${LOG_FILENAME}.${i}`);
       try {
@@ -116,5 +115,39 @@ export class DecisionLog {
       // no active file yet
     }
     return collected.slice(-n);
+  }
+
+  /** Most recent n decisions whose raw line matches `line`, newest last,
+   *  across rotations. Filters before parsing, so a narrow query (one
+   *  session's records) costs a substring test per line, not a JSON parse
+   *  of the whole log. */
+  async tailWhere(
+    line: (raw: string) => boolean,
+    n: number,
+  ): Promise<(LogRecord & { ts: string })[]> {
+    const collected: (LogRecord & { ts: string })[] = [];
+    const read = async (path: string) => {
+      let text: string;
+      try {
+        text = await readFile(path, "utf8");
+      } catch {
+        return; // rotated file absent, or no active file yet
+      }
+      const lines = text.split("\n").filter(Boolean);
+      for (let i = lines.length - 1; i >= 0 && collected.length < n; i--) {
+        const raw = lines[i]!;
+        if (!line(raw)) continue;
+        try {
+          collected.push(JSON.parse(raw));
+        } catch {
+          // a torn line (crash mid-append) is skipped, not fatal
+        }
+      }
+    };
+    await read(this.path);
+    for (let i = 1; i <= this.opts.keepFiles && collected.length < n; i++) {
+      await read(join(this.opts.dir, `${LOG_FILENAME}.${i}`));
+    }
+    return collected.reverse();
   }
 }

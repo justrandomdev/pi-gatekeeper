@@ -104,38 +104,50 @@ describe("rule matching", () => {
 
   it("self-protection catches env-var and dot-segment path spellings in shell text", async () => {
     const touches = (command: string) => touchesGatePaths("bash", { command }, HOME);
-    expect(await touches("cat $HOME/.pi/agent/gate/config.json")).toBe(true);
-    expect(await touches("cat ${HOME}/.pi/agent/gate/config.json")).toBe(true);
-    expect(await touches("cat /home/op/.pi/agent/../agent/gate/config.json")).toBe(true);
-    expect(await touches("sed -i s/../../ /home/op/.pi/agent/gate/../gate/config.json")).toBe(true);
+    expect(await touches("cat $HOME/.pi/agent/gate/config.json")).toBeTruthy();
+    expect(await touches("cat ${HOME}/.pi/agent/gate/config.json")).toBeTruthy();
+    expect(await touches("cat /home/op/.pi/agent/../agent/gate/config.json")).toBeTruthy();
+    expect(await touches("sed -i s/../../ /home/op/.pi/agent/gate/../gate/config.json")).toBeTruthy();
   });
 
   it("self-protection catches cd into a gate directory before relative access", async () => {
     const touches = (command: string) => touchesGatePaths("bash", { command }, HOME);
-    expect(await touches("cd ~/.pi/agent/gate && cat config.json")).toBe(true);
-    expect(await touches("cd /home/op/code && cat notes.md")).toBe(false);
+    expect(await touches("cd ~/.pi/agent/gate && cat config.json")).toBeTruthy();
+    expect(await touches("cd /home/op/code && cat notes.md")).toBeFalsy();
   });
 
   it("self-protection tracks cwd across a chain of cd commands", async () => {
     const touches = (command: string, cwd?: string) => touchesGatePaths("bash", { command }, HOME, cwd);
     // `cd ~` then `cd .pi/agent/gate` lands inside the user-level gate dir.
-    expect(await touches("cd ~ && cd .pi/agent/gate && cat config.json")).toBe(true);
+    expect(await touches("cd ~ && cd .pi/agent/gate && cat config.json")).toBeTruthy();
     // The chain is detected regardless of the original cwd — `cd ~` overrides it.
-    expect(await touches("cd ~ && cd .pi/agent/gate && cat config.json", "/elsewhere")).toBe(true);
+    expect(await touches("cd ~ && cd .pi/agent/gate && cat config.json", "/elsewhere")).toBeTruthy();
     // An absolute-path cd followed by a relative one resolves against the new cwd,
     // not the original (without cwd tracking the second cd would resolve to
     // /proj/.pi/agent/gate, which isn't a gate dir; with tracking it resolves
     // to /home/op/.pi/agent/gate, which is).
-    expect(await touches("cd /home/op && cd .pi/agent/gate && cat config.json", "/proj")).toBe(true);
+    expect(await touches("cd /home/op && cd .pi/agent/gate && cat config.json", "/proj")).toBeTruthy();
     // The same relative cd from the original cwd, without the chain, lands somewhere
     // else and is harmless.
-    expect(await touches("cd .pi/agent/gate", "/proj")).toBe(false);
+    expect(await touches("cd .pi/agent/gate", "/proj")).toBeFalsy();
+  });
+
+  it("self-protection reports the path it matched, never a command fragment", async () => {
+    const gated = ["", "home", "op", ".pi", "agent", "gate", "config.json"].join("/");
+    // a file tool reports the target itself
+    expect(await touchesGatePaths("read", { path: gated }, HOME)).toContain("config.json");
+    // a shell hit reports the gate directory, not the command text
+    const shell = await touchesGatePaths("bash", { command: `cat ${gated}` }, HOME);
+    expect(shell).toBeTruthy();
+    expect(shell).not.toContain("cat ");
+    // a clean call reports nothing
+    expect(await touchesGatePaths("read", { path: "/tmp/notes.txt" }, HOME)).toBeUndefined();
   });
 
   it("self-protection still ignores look-alike paths", async () => {
     const touches = (command: string) => touchesGatePaths("bash", { command }, HOME);
-    expect(await touches("ls /home/op/notes.pi/gatekeeper")).toBe(false);
-    expect(await touches("cat $HOME/notes.txt")).toBe(false);
+    expect(await touches("ls /home/op/notes.pi/gatekeeper")).toBeFalsy();
+    expect(await touches("cat $HOME/notes.txt")).toBeFalsy();
   });
 
   it("matchRules returns the first hit in order", () => {
@@ -163,17 +175,17 @@ describe("rule matching", () => {
   it("self-protection resolves file-tool targets against the cwd", async () => {
     const touches = (path: string, cwd?: string) => touchesGatePaths("read", { path }, HOME, cwd);
     // the project gate dir, reached by a relative spelling
-    expect(await touches(".pi/gate/config.json", "/proj")).toBe(true);
+    expect(await touches(".pi/gate/config.json", "/proj")).toBeTruthy();
     // the user gate dir, reached from home
-    expect(await touches(".pi/agent/gate/config.json", "/home/op")).toBe(true);
+    expect(await touches(".pi/agent/gate/config.json", "/home/op")).toBeTruthy();
     // dot-detours and doubled slashes that normalize into a gate spelling
-    expect(await touches(".pi/agent/../agent/gate/config.json", "/elsewhere")).toBe(true);
-    expect(await touches(".pi//agent/gate/config.json", "/elsewhere")).toBe(true);
+    expect(await touches(".pi/agent/../agent/gate/config.json", "/elsewhere")).toBeTruthy();
+    expect(await touches(".pi//agent/gate/config.json", "/elsewhere")).toBeTruthy();
     // relative spellings protect the gate even without a cwd
-    expect(await touches(".pi/gate/config.json")).toBe(true);
+    expect(await touches(".pi/gate/config.json")).toBeTruthy();
     // look-alikes pass
-    expect(await touches("src/main.ts", "/proj")).toBe(false);
-    expect(await touches(".pi/gatekeeper-notes.md", "/proj")).toBe(false);
+    expect(await touches("src/main.ts", "/proj")).toBeFalsy();
+    expect(await touches(".pi/gatekeeper-notes.md", "/proj")).toBeFalsy();
   });
 
   it("self-protection follows symlink chains into the gate directory (ADR-0003)", async () => {
@@ -184,14 +196,14 @@ describe("rule matching", () => {
     const link = join(home, "notes");
     await symlink(gateDir, link);
     // a file-tool read through the symlink is caught
-    expect(await touchesGatePaths("read", { path: join(link, "config.json") }, home)).toBe(true);
+    expect(await touchesGatePaths("read", { path: join(link, "config.json") }, home)).toBeTruthy();
     // a shell command referencing the symlink is caught
-    expect(await touchesGatePaths("bash", { command: `cat ${join(link, "config.json")}` }, home)).toBe(true);
+    expect(await touchesGatePaths("bash", { command: `cat ${join(link, "config.json")}` }, home)).toBeTruthy();
     // the same spelling pointing at a real non-gate dir is not
     const plain = join(home, "plain");
     await mkdir(plain);
     await writeFile(join(plain, "config.json"), "{}", "utf8");
-    expect(await touchesGatePaths("read", { path: join(plain, "config.json") }, home)).toBe(false);
+    expect(await touchesGatePaths("read", { path: join(plain, "config.json") }, home)).toBeFalsy();
     await rm(home, { recursive: true, force: true });
   });
 

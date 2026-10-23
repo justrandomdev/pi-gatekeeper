@@ -14,7 +14,7 @@ Every tool call passes through the gate, in order:
 4. **The model gate** — a Jev/System One-compatible decision model (default: local Ollama `clef-flash`) classifies the call `safe`, `unsafe`, or `unsure` with a confidence score. **The model is the primary classifier** ([ADR-0005](docs/adr/0005-the-decision-model-is-the-primary-classifier.md)): `safe` ≥ threshold **and** an unsafe probability ≤ 0.1 (a fixed bound) → auto-allow (any tool); `unsafe` ≥ threshold → auto-block; everything else → operator. With several `endpoints` configured, the entries act per `multiEndpointMode` ([ADR-0007](docs/adr/0007-multi-endpoint-modes.md)): `modelSelect` (default) — only the operator-selected endpoint classifies (first entry until you pick one: `/gate model <name>`); `jury` ([ADR-0006](docs/adr/0006-the-endpoint-jury-runs-most-pessimistic.md)) — every endpoint classifies in parallel, the gate waits for all, and the most pessimistic verdict wins — one dissenting `unsafe` blocks, auto-allow needs unanimity; `fallback` — the entries are tried in array order until one answers, the survivor deciding alone under the same single-judge matrix.
 5. **The operator** — a bordered prompt (classification and probabilities colored green/red/yellow) with `a: allow · n/esc: deny`. Nothing persists from a prompt; persistent allows are explicit rules.
 
-Model failure or timeout routes to the operator (`failMode: ask`) or blocks (`failMode: block`, for headless use).
+Model failure or timeout routes to the operator (`failMode: ask`) or blocks (`failMode: block`, for headless use). The gate's posture is `mode: manual` (default) or `auto` ([ADR-0008](docs/adr/0008-auto-mode.md)): auto allows the uncertainty bucket — unsure, below-threshold, bound-exceeded safe — instead of asking, while confident `unsafe`, deny rules, secrets hits, and self-protection still block and model failure still routes by `failMode`. Default `manual`; nothing enables auto implicitly.
 
 ## Security model
 
@@ -23,10 +23,10 @@ Model failure or timeout routes to the operator (`failMode: ask`) or blocks (`fa
 - **Slash commands are operator-run** — typed by you in the TUI, never issued by the agent.
 - **Manual edits are human actions** — your editor is outside the gate.
 - **Remote endpoints are data egress**: configuring a remote clef/Jev endpoint sends every gated call's tool name, the first 100 characters of its arguments, the working directory, and the current task to that service (ADR-0002). Local-first is the default. The secrets auto-update fetch is operator-configured (`secrets.source`) and failure keeps the last snapshot.
-- **Ask fatigue is a security failure, not a UX nuisance.** The model is the primary classifier (ADR-0005) precisely so the operator is asked only when the model is genuinely uncertain. The accepted tradeoff: a confident-but-wrong `safe` can auto-allow any tool — contained by the deterministic layers ahead of the model and the threshold, not by forced asks.
+- **Ask fatigue is a security failure, not a UX nuisance.** The model is the primary classifier (ADR-0005) precisely so the operator is asked only when the model is genuinely uncertain. The accepted tradeoff: a confident-but-wrong `safe` can auto-allow any tool — contained by the deterministic layers ahead of the model and the threshold, not by forced asks. For unattended swarm runs, `mode: auto` goes further and allows the uncertainty bucket too — an explicit, risk-accepted posture (ADR-0008), never the default.
 - Residual: editing gatekeeper's *source* in a dev repo isn't covered by self-protection; it relies on the decision model and operator review.
 - Residual: self-protection matches literal, `$HOME`-expanded, dot-segment-normalized, and `realpath`-resolved paths — obfuscated spellings (base64, dynamic paths, shell variables) fall through to the model gate, which sees the gate dirs as protected paths.
-- Residual: the decision log records the first 100 characters of arguments — a short secret inside them lands in `decisions.jsonl`. The log directory is created `0o700`; rotate with `log.retentionDays`.
+- Residual: the decision log records the **full** arguments, so a secret the corpus misses lands in `decisions.jsonl` (calls stopped before the secrets scan log a constant instead). The log directory is created `0o700`; rotate with `log.retentionDays`.
 - Residual: secrets past the 256KB per-call scan cap, and obfuscations the gitleaks corpus doesn't cover, fall through to the model gate.
 
 ## Installation
@@ -43,9 +43,9 @@ The gate is configured at runtime with slash commands, typed by you in the TUI �
 
 - `/gate` — status (endpoints, mode, threshold, rules, log, session stats); `/gate model <name>` — select the served endpoint
 - `/gate:rules` — list / add / remove / test rules (`--project` writes project level)
-- `/gate:config` — show effective config or set any key: `threshold`, `endpoint.*`, `multiEndpointMode`, `notify`, …
+- `/gate:config` — show effective config or set any key: `mode`, `threshold`, `endpoint.*`, `multiEndpointMode`, `notify`, …
 - `/gate:secrets` — secrets engine status / `update` / `test "<text>"`
-- `/gate:log [n] [tool]` — review recent decisions
+- `/gate:log [n] [tool] [session <prefix>]` — review recent decisions
 
 Full command reference: the [Slash commands](#slash-command-reference) section below. Manual JSON edits are next.
 
@@ -228,7 +228,8 @@ Copy to `~/.pi/agent/gate/config.json` and fill in the two `<api-key>` placehold
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | `false` passes everything through ungated — except self-protection, which applies whenever the gate is loaded. |
-| `threshold` | `0.65` | Minimum confidence for autonomous allow/block. Auto-allow additionally requires the model's unsafe probability ≤ 0.1 (a fixed bound, not configurable). Below either: operator. |
+| `mode` | `"manual"` | The gate's posture (ADR-0008): `manual` asks on uncertainty per the ADR-0005 matrix; `auto` voids the ask side — `unsure`, below-threshold `safe`, bound-exceeded `safe`, and below-threshold `unsafe` all allow without asking — while `unsafe` at or above the threshold, deny rules, secrets hits, and self-protection still block, and model failure still routes by `failMode`. Set via `/gate:config set mode`. An invalid value is a config error, never a silent manual. |
+| `threshold` | `0.65` | Minimum confidence for autonomous allow/block. Auto-allow additionally requires the model's unsafe probability ≤ 0.1 (a fixed bound, not configurable). Below either: operator — **unless `mode: auto`**, which voids the ask side: `unsure`, below-threshold `safe`, bound-exceeded `safe`, and even a below-threshold `unsafe` all allow unattended. The threshold still draws the confident-block line, so raising it widens the auto-allow set. |
 | `endpoint.url` | `http://localhost:11434/v1/systemone` | Full request URL of a Jev/System One-compatible service — the gate POSTs here verbatim. |
 | `endpoint.model` | `clef-flash` | Any model the endpoint serves (`clef`, a remote Jev, …). |
 | `endpoint.apiKey` | — | Bearer token for remote services. Settable via `set` (the echoed value is redacted as `***`); nothing else echoes it. |
@@ -245,7 +246,8 @@ Copy to `~/.pi/agent/gate/config.json` and fill in the two `<api-key>` placehold
 | `log.maxLines` | `10000` | Rotate after this many lines. |
 | `log.keepFiles` | `10` | Rotated files kept (`decisions.jsonl.1` … `.10`). |
 | `log.retentionDays` | `30` | Rotated files older than this are deleted. |
-| `log.truncateArgsBytes` | `2048` | Cap on the argument preview shown in the **operator prompt**; the model and the log see only the first 100 characters. |
+| `log.truncateArgsBytes` | `2048` | Cap on the argument preview shown in the **operator prompt**; the model sees only the first 100 characters (the log records the full arguments). |
+| `log.columns` | default view | The decision-log view's visible columns, comma-separated registry names (`time,tool,action,source,class,model,session,args,reason`); written by the view's column selector, **user level only** (a view preference, not a repo posture). Session ID is off until you toggle it on. Selector writes are serialized, so rapid toggles cannot corrupt the file. |
 | `secrets.enabled` | `true` | The deterministic secrets engine (ADR-0004). One switch — a disabled gate turns it off too. |
 | `secrets.autoUpdate` | `true` | Fetch `secrets.source` on start and adopt it when it passes the sanity gates. |
 | `secrets.source` | gitleaks master | The gitleaks.toml source URL. Pin a release tag by changing it. |
@@ -297,7 +299,7 @@ The scan covers the full `bash`/`powershell` command and the full serialized arg
 
 ### The decision log
 
-`decisions.jsonl` (plus rotated `.1`, `.2`, …) — one JSON line per decision: timestamp, tool, the same first-100-character argument view the model saw (plus the total length; a secrets block logs a constant in the args column — a detected secret never lands in this log), action, source (`rule` / `model` / `operator` / `fail` / `protected` / `secrets` / `disabled`), classification, confidence, and the reason. A jury run attaches the per-endpoint verdicts as a `jury` array (`name`, `choice`, `confidence`, `probabilities`; an unavailable endpoint is recorded as such) — a fallback chain's attempts in the same shape, and a modelSelect run names its serving judge in an `endpoint` field. Full file contents never reach the model state (ADR-0002) or this log — but a short secret the corpus misses, inside the first 100 characters of a command, is an argument and does land here.
+`decisions.jsonl` (plus rotated `.1`, `.2`, …) — one JSON line per decision: timestamp, tool, the full serialized arguments (a secrets block, and a self-protection block — which runs before the secrets scan — log a constant in the args column, so a detected secret never lands in this log), action, source (`rule` / `model` / `operator` / `auto` / `fail` / `protected` / `secrets` / `disabled`), classification, confidence, the pi session id (`sessionId` — a session's decisions are retrievable with the `session` filter), and the reason. A jury run attaches the per-endpoint verdicts as a `jury` array (`name`, `choice`, `confidence`, `probabilities`; an unavailable endpoint is recorded as such) — a fallback chain's attempts in the same shape, and a modelSelect run names its serving judge in an `endpoint` field. Full file contents never reach the model state (ADR-0002) or this log — but a secret the corpus misses is an argument and does land here.
 
 ## Slash command reference
 
@@ -312,7 +314,7 @@ All commands are operator-run; the agent cannot invoke them.
 /gate model clef --project   project-level selection (ADR-0001)
 ```
 
-The status shows the `endpoints` members (`name @ url`) and, for multi-endpoint configs, a `Mode:` line — `jury › N endpoints`, `fallback › first-hit`, or `modelSelect › <judge>` (with a note when your selection no longer resolves). An invalid hand-edited mode is reported on that line.
+The status shows `Gate mode: manual|auto (<user|project|default>)` — the posture and the level that decided it — plus, for multi-endpoint configs, an `Endpoint mode:` line: `jury › N endpoints`, `fallback › first-hit`, or `modelSelect › <judge>` (with a note when your selection no longer resolves). An invalid hand-edited value is reported on its line.
 
 ### `/gate:secrets` — the secrets engine
 
@@ -347,6 +349,7 @@ The auto-update runs in the background on start and reports only on change or fa
 /gate:config set endpoints.clef-flash.url https://…  set a field on a jury member (addressed by resolved name)
 /gate:config set multiEndpointMode jury          jury / fallback / modelSelect (ADR-0007)
 /gate:config set selectedEndpoint clef           same as /gate model clef
+/gate:config set mode auto                       posture: manual (default) / auto (ADR-0008)
 /gate:config test bash '{"command":"ls /tmp"}'   fan the sample call out to every endpoint, list verdicts — comparison regardless of mode
 /gate:config set secrets.autoUpdate false     stop the background auto-update
 /gate:config set log.level project              log into the repo
@@ -362,7 +365,11 @@ The auto-update runs in the background on start and reports only on change or fa
 /gate:log                last 20 decisions
 /gate:log 50             last 50
 /gate:log 20 bash        last 20 bash decisions
+/gate:log 50 session abc12   that session's decisions, resolved against the whole log
+                                (ambiguous → candidates listed; no match → said so)
 ```
+
+In the TUI the log opens as an overlay: ↑↓ select, Enter expands a record (full, untruncated arguments — ↑↓ and PgUp/PgDn scroll a long one), and `c` opens a column selector — ↑↓ move, x/space toggle, Esc back with changes kept and persisted (`log.columns`, user level; Session ID column off by default).
 
 Every decision is also shown live as a one-line transparency notification (default `notify: "always"`); set `notify: "summary"` to silence auto-allow notifications, or `notify: "off"` to suppress transparency entirely. `notify: "debug"` additionally dumps the exact request body posted to the decision model and the answer it acted on, for every classification — the way to see precisely what the judge saw and concluded. Auto-allows are still recorded in the decision log regardless.
 

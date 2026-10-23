@@ -66,7 +66,20 @@ export interface LogConfig {
   /** Character cap on the argument preview — a JS string budget; the
    *  name says bytes and is kept for config compatibility. */
   truncateArgsBytes: number;
+  /** The decision-log view's visible columns (ADR-0008), in registry
+   *  order. Absent → the default set, Session ID off. Written by the
+   *  view's column selector; user level. */
+  columns?: LogColumn[];
 }
+
+/** The decision-log column registry (ADR-0008): the TUI selector toggles
+ *  these, and `log.columns` stores the visible subset, always rendered in
+ *  this order. Config-shaped, so it lives here rather than with the view. */
+export const LOG_COLUMNS = ["time", "tool", "action", "source", "class", "model", "session", "args", "reason"] as const;
+export type LogColumn = (typeof LOG_COLUMNS)[number];
+
+/** The default view: everything the table always showed; Session ID off. */
+export const DEFAULT_LOG_COLUMNS: LogColumn[] = ["time", "tool", "action", "source", "class", "model", "args", "reason"];
 
 export interface SecretsConfig {
   enabled: boolean;
@@ -78,8 +91,16 @@ export interface SecretsConfig {
 
 export interface GatekeeperConfig {
   enabled: boolean;
+  /** The gate's posture (ADR-0008): `manual` — the ADR-0005 matrix with
+   *  operator asks; `auto` — the ask side is void (unsure, below-threshold
+   *  `safe`, bound-exceeded `safe`, and below-threshold `unsafe` allow);
+   *  `fail` stays on `failMode`. Default `manual`, safe by default:
+   *  nothing enables auto implicitly. */
+  mode: GateMode;
   /** Minimum confidence for autonomous allow/block. Auto-allow additionally
-   *  requires a negligible unsafe probability (a fixed bound, see decision.ts). */
+   *  requires a negligible unsafe probability (a fixed bound, see decision.ts).
+   *  In auto mode the bound is void and the threshold still draws the
+   *  confident-block line (ADR-0008). */
   threshold: number;
   endpoint: EndpointConfig;
   /** The endpoint jury (ADR-0006). Present and non-empty: the entries
@@ -119,6 +140,22 @@ export interface GatekeeperConfig {
 
 export const MULTI_ENDPOINT_MODES = ["jury", "fallback", "modelSelect"] as const;
 export type MultiEndpointMode = (typeof MULTI_ENDPOINT_MODES)[number];
+
+/** The gate's posture (ADR-0008): manual is the default. */
+export const GATE_MODES = ["manual", "auto"] as const;
+export type GateMode = (typeof GATE_MODES)[number];
+
+/** The gate's posture (ADR-0008). An invalid hand-edited value is a
+ *  config error — fail loudly, never misread the posture: a silent
+ *  fallback would run manual while the operator believes auto (or, worse,
+ *  report a posture the gate is not in). */
+export function resolveGateMode(config: GatekeeperConfig): GateMode {
+  const value = config.mode;
+  if (!(GATE_MODES as readonly string[]).includes(value)) {
+    throw new Error(`invalid mode "${value}" — must be one of ${GATE_MODES.join(", ")}`);
+  }
+  return value;
+}
 
 /** The multi-endpoint act (ADR-0007). Absent → `modelSelect` — the
  *  deliberate break from ADR-0006's implicit jury, which stays a
@@ -161,6 +198,7 @@ export const DEFAULT_POLICY = [
 
 export const DEFAULT_CONFIG: GatekeeperConfig = {
   enabled: true,
+  mode: "manual",
   threshold: 0.65,
   endpoint: {
     url: "http://localhost:11434/v1/systemone",

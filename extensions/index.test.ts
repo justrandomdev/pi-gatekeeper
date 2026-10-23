@@ -80,12 +80,16 @@ function makeEnv(canned: { choice: "safe" | "unsafe" | "unsure"; confidence: num
     confirm: async () => false,
     input: async () => undefined,
   };
+  // pi always provides a session manager (its getSessionId is required);
+  // the default keeps the fake faithful so the gate can call it straight.
+  const sessionManager = { getSessionId: () => "sess-default" };
   const ctx = (over: Record<string, unknown> = {}) => ({
     ui,
     hasUI: true,
     cwd: projectDir,
     isProjectTrusted: () => false,
     mode: "tui",
+    sessionManager,
     ...over,
   });
   return { requests, fetchFn, ui, ctx };
@@ -104,6 +108,25 @@ async function setup(
   const env = makeEnv(canned);
   await createGatekeeper(pi, { home: userHome, fetchFn: fetchOverride ?? env.fetchFn });
   return { captured, env };
+}
+
+/** The log/config writes are fire-and-forget: poll until the file holds
+ *  `want` lines, or until `match` accepts its text. */
+async function waitForFile(
+  path: string,
+  want = 1,
+  match?: (text: string) => boolean,
+): Promise<string> {
+  let text = "";
+  const done = (t: string) => (match ? match(t) : t.trim().split("\n").filter(Boolean).length >= want);
+  for (let i = 0; i < 50 && !done(text); i++) {
+    try {
+      text = await readFile(path, "utf8");
+    } catch {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+  return text;
 }
 
 /** A fetch stub serving gitleaks TOML at the source URL, classifier JSON elsewhere. */
@@ -361,15 +384,15 @@ describe("gatekeeper extension", () => {
       const handler = captured.commands.get("gate")!.handler;
 
       await handler("model minerva", env.ctx());
-      expect(env.ui.notified.some((n) => n.includes("Mode: "))).toBe(false); // single endpoint: no mode
+      expect(env.ui.notified.some((n) => n.includes("Endpoint mode: "))).toBe(false); // single endpoint: no mode
 
       await writeConfig({ multiEndpointMode: "fallback", endpoints: twoEndpoints });
       await handler("", env.ctx());
-      expect(env.ui.notified.some((n) => n.includes("Mode: fallback › first-hit"))).toBe(true);
+      expect(env.ui.notified.some((n) => n.includes("Endpoint mode: fallback › first-hit"))).toBe(true);
 
       await writeConfig({ multiEndpointMode: "juryy", endpoints: twoEndpoints });
       await handler("", env.ctx());
-      expect(env.ui.notified.some((n) => n.includes("Mode: invalid multiEndpointMode"))).toBe(true);
+      expect(env.ui.notified.some((n) => n.includes("Endpoint mode: invalid multiEndpointMode"))).toBe(true);
     });
   });
 
@@ -430,18 +453,10 @@ describe("gatekeeper extension", () => {
     const { captured, env } = await setup({ choice: "safe", confidence: 0.9 });
     await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/tmp/a" } });
     const logPath = join(userHome, ".pi/agent/gate/decisions.jsonl");
-    // the log write is fire-and-forget; poll until it lands
-    let lines: string[] = [];
-    for (let i = 0; i < 50 && lines.length < 1; i++) {
-      try {
-        lines = (await readFile(logPath, "utf8")).trim().split("\n").filter(Boolean);
-      } catch {
-        await new Promise((r) => setTimeout(r, 20));
-      }
-    }
-    if (!lines.length) lines = ["(log never flushed)"];
+    const lines = (await waitForFile(logPath)).trim().split("\n").filter(Boolean);
+    if (!lines.length) lines.push("(log never flushed)");
     expect(lines).toHaveLength(1);
-    const record = JSON.parse(lines[0]);
+    const record = JSON.parse(lines[0]!);
     expect(record.tool).toBe("read");
     expect(record.action).toBe("allow");
     expect(record.source).toBe("model");
@@ -668,14 +683,7 @@ describe("gatekeeper extension", () => {
     // the model was never consulted and no secret landed in the log
     expect(env.requests).toHaveLength(0);
     const logPath = join(userHome, ".pi/agent/gate/decisions.jsonl");
-    let logText = "";
-    for (let i = 0; i < 50 && !logText; i++) {
-      try {
-        logText = await readFile(logPath, "utf8");
-      } catch {
-        await new Promise((r) => setTimeout(r, 20));
-      }
-    }
+    const logText = await waitForFile(logPath);
     expect(logText).toContain("\"source\":\"secrets\"");
     expect(logText).not.toContain("AKIAIOSFODNN7EXAMPLA");
   });
@@ -699,16 +707,8 @@ describe("gatekeeper extension", () => {
     expect(result?.reason).not.toContain(awsKey);
     // the model was never consulted
     expect(env.requests).toHaveLength(0);
-    // poll the log (the write is fire-and-forget)
     const logPath = join(userHome, ".pi/agent/gate/decisions.jsonl");
-    let logText = "";
-    for (let i = 0; i < 50 && !logText; i++) {
-      try {
-        logText = await readFile(logPath, "utf8");
-      } catch {
-        await new Promise((r) => setTimeout(r, 20));
-      }
-    }
+    const logText = await waitForFile(logPath);
     // the decision is logged: the masked peek rides in the reason, the
     // args column is the constant — the key itself never lands in the log
     expect(logText).toContain('"source":"secrets"');
@@ -723,14 +723,7 @@ describe("gatekeeper extension", () => {
       input: { path: secretPath },
     });
     expect(second?.block).toBe(true);
-    let logText2 = logText;
-    for (let i = 0; i < 50 && logText2 === logText; i++) {
-      try {
-        logText2 = await readFile(logPath, "utf8");
-      } catch {
-        await new Promise((r) => setTimeout(r, 20));
-      }
-    }
+    const logText2 = await waitForFile(logPath, 2);
     expect(logText2.trim().split("\n")).toHaveLength(2);
     expect(logText2).not.toContain(awsKey);
   });
@@ -1096,5 +1089,318 @@ describe("gatekeeper extension", () => {
       expect(lines[lines.length - 1]).toContain("Enter/Esc back");
       expect(lines.join("\n")).toContain("time: ");
     });
+    it("/gate:config show reports the posture and the log column set", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv();
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      await captured.commands.get("gate:config")!.handler("", env.ctx());
+      const shown = env.ui.notified.find((n) => n.includes("effective config"));
+      expect(shown).toContain("mode: manual");
+      expect(shown).toContain("log.columns: default");
+    });
+
+    it("an invalid hand-edited mode is reported as a config error, never read as manual", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv({ choice: "safe", confidence: 0.99 });
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      await writeFile(
+        join(userHome, ".pi/agent/gate/config.json"),
+        JSON.stringify({ secrets: { autoUpdate: false }, mode: "AUTO" }),
+      );
+      const result = await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/tmp/a" } });
+      expect(result?.block).toBe(true);
+      expect(result?.reason).toContain('invalid mode "AUTO"');
+      await captured.commands.get("gate")!.handler("", env.ctx());
+      const status = env.ui.notified.find((n) => n.includes("Gatekeeper"));
+      expect(status).toContain("Gate mode: invalid mode");
+      expect(env.requests).toHaveLength(0);
+    });
+
+    it("session lookup is log-scoped: a quiet session outside the tail window is still found", async () => {
+      const { captured, env } = await setup({ choice: "safe", confidence: 0.9 });
+      await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/tmp/quiet" } }, {
+        sessionManager: { getSessionId: () => "sess-quiet" },
+      });
+      for (let i = 0; i < 8; i++) {
+        await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: `/tmp/loud${i}` } }, {
+          sessionManager: { getSessionId: () => "sess-loud" },
+        });
+      }
+      await waitForFile(join(userHome, ".pi/agent/gate/decisions.jsonl"), 9);
+      const handler = captured.commands.get("gate:log")!.handler;
+      // n=1 would have looked at the last 4 lines only; the whole log is scanned
+      await handler("1 session sess-quiet", env.ctx({ mode: "rpc" }));
+      const line = env.ui.notified.find((n) => n.includes("gate › last"));
+      expect(line).toContain("1 decisions:");
+      expect(line).not.toContain("(none yet)");
+      // a prefix that matches nothing says so, distinctly from an empty window
+      await handler("1 session nope", env.ctx({ mode: "rpc" }));
+      expect(env.ui.notified.some((n) => n.includes('no session matching "nope"'))).toBe(true);
+    });
+
+    it("rapid column toggles keep the config file valid and preserve sibling keys (write race)", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv({ choice: "unsafe", confidence: 0.97 });
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      // sibling keys a corrupting write would swallow
+      await writeFile(
+        join(userHome, ".pi/agent/gate/config.json"),
+        JSON.stringify({ secrets: { autoUpdate: false }, failMode: "block", notify: "off", mode: "auto" }),
+      );
+      await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/etc/passwd" } });
+      const overlay = captureOverlay();
+      overlay.install(env.ui);
+      await captured.commands.get("gate:log")!.handler("", env.ctx());
+      const view = overlay.build();
+
+      view.handleInput("c");
+      // tread the menu quickly, toggling on every step: the persisted writes
+      // are un-awaited, one per toggle
+      for (const key of [" ", "j", " ", "j", " ", "j", " "]) {
+        view.handleInput(key);
+      }
+      const cfgText = await waitForFile(
+        join(userHome, ".pi/agent/gate/config.json"),
+        1,
+        (t) => {
+          try {
+            return JSON.parse(t).log?.columns?.length === 5;
+          } catch {
+            return false;
+          }
+        },
+      );
+      const cfg = JSON.parse(cfgText); // must parse — a torn file throws here
+      expect(cfg.failMode).toBe("block");
+      expect(cfg.notify).toBe("off");
+      expect(cfg.mode).toBe("auto");
+      expect(cfg.log.columns).toHaveLength(5);
+
+      // and the gate still runs on the merged config, not the defaults
+      await captured.commands.get("gate")!.handler("", env.ctx());
+      const status = env.ui.notified.find((n) => n.includes("Gatekeeper"));
+      expect(status).toContain("Fail mode: block");
+      expect(status).toContain("Gate mode: auto (user)");
+    });
+
+    it("the column selector toggles columns and persists the set (c opens, x/space toggles, Esc back)", async () => {
+      const { captured, env } = await setup({ choice: "unsafe", confidence: 0.97 });
+      await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/etc/passwd" } });
+      const overlay = captureOverlay();
+      overlay.install(env.ui);
+      await captured.commands.get("gate:log")!.handler("", env.ctx());
+      const view = overlay.build();
+
+      view.handleInput("c"); // open the selector
+      const menu = view.render(100).join("\n");
+      expect(menu).toContain("[ ] session");
+      expect(menu).toContain("[x] tool");
+
+      view.handleInput(" "); // toggle the highlighted column (time) off
+      const after = view.render(100).join("\n");
+      expect(after).toContain("[ ] time");
+      const columns = JSON.parse(
+        await waitForFile(join(userHome, ".pi/agent/gate/config.json"), 1, (t) => t.includes('"columns"')),
+      ).log?.columns as string[] | undefined;
+      expect(columns).toBeDefined();
+      expect(columns).not.toContain("time");
+
+      // a short terminal scrolls the menu instead of clipping it
+      const short = overlay.build(10);
+      short.handleInput("c");
+      for (let i = 0; i < 8; i++) short.handleInput("j");
+      const shortLines = short.render(100);
+      expect(shortLines.length).toBeLessThanOrEqual(9); // floor(10 * 0.9)
+      expect(shortLines.join("\n")).toContain("[x] reason");
+      expect(shortLines[shortLines.length - 1]).toContain("Esc back");
+
+      view.handleInput("\x1b"); // back to the table, changes kept
+      const table = view.render(100).join("\n");
+      expect(table).not.toMatch(/\btime\b.*\btool\b/);
+      expect(table).toMatch(/tool\s+action/);
+    });
+
+    it("the detail view shows the full args and pages to their end", async () => {
+      const tail = "TAILMARKER-END";
+      const content = `${"a".repeat(3000)}${tail}`;
+      const logPath = join(userHome, ".pi/agent/gate/decisions.jsonl");
+      await mkdir(dirname(logPath), { recursive: true });
+      await writeFile(
+        logPath,
+        `${JSON.stringify({
+          ts: "2026-01-01T00:00:00.000Z",
+          tool: "write",
+          args: JSON.stringify({ path: "/tmp/a", content }),
+          action: "allow",
+          source: "model",
+        })}\n`,
+      );
+      const { captured, env } = await setup({ choice: "safe", confidence: 0.9 });
+      const overlay = captureOverlay();
+      overlay.install(env.ui);
+      await captured.commands.get("gate:log")!.handler("", env.ctx());
+      const view = overlay.build();
+
+      view.handleInput("\r"); // detail
+      const first = view.render(100).join("\n");
+      // the whole argument is stored and shown, not clipped with a count
+      expect(first).not.toContain("chars)");
+
+      let seen = first;
+      for (let i = 0; i < 50 && !seen.includes(tail); i++) {
+        view.handleInput("\x1b[6~"); // pageDown
+        seen += "\n" + view.render(100).join("\n");
+      }
+      expect(seen).toContain(tail);
+    });
+  });
+
+    describe("post-review hardening (ADR-0008)", () => {
+    it("a malformed config level is reported, not silently read as defaults", async () => {
+      const { captured, env } = await setup({ choice: "safe", confidence: 0.99 });
+      await writeFile(join(userHome, ".pi/agent/gate/config.json"), '{ "failMode": "block",, }');
+      await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/tmp/a" } });
+      expect(env.ui.notified.some((n) => n.includes("config unreadable at user level"))).toBe(true);
+    });
+
+    it("/gate names the level that decided the posture", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv();
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      await writeFile(
+        join(userHome, ".pi/agent/gate/config.json"),
+        JSON.stringify({ secrets: { autoUpdate: false }, mode: "auto" }),
+      );
+      await captured.commands.get("gate")!.handler("", env.ctx());
+      expect(env.ui.notified.some((n) => n.includes("Gate mode: auto (user)"))).toBe(true);
+
+      // a trusted repo's own config decides next: the invariant is visible
+      await mkdir(join(projectDir, ".pi/gate"), { recursive: true });
+      await writeFile(join(projectDir, ".pi/gate/config.json"), JSON.stringify({ mode: "manual" }));
+      await captured.commands.get("gate")!.handler("", env.ctx({ isProjectTrusted: () => true }));
+      expect(env.ui.notified.some((n) => n.includes("Gate mode: manual (project)"))).toBe(true);
+    });
+
+    it("log.columns rejects an empty list and refuses --project writes", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv();
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      const handler = captured.commands.get("gate:config")!.handler;
+      await handler("set log.columns ,,,", env.ctx());
+      expect(env.ui.notified.some((n) => n.includes("must be a comma-separated list from:"))).toBe(true);
+      await handler("set log.columns time --project", env.ctx({ isProjectTrusted: () => true }));
+      expect(env.ui.notified.some((n) => n.includes("log.columns is user-level only"))).toBe(true);
+      // neither write created the key
+      expect(JSON.parse(await readFile(join(userHome, ".pi/agent/gate/config.json"), "utf8")).log?.columns)
+        .toBeUndefined();
+    });
+
+    it("gate:log 0 shows nothing instead of dumping the whole log", async () => {
+      const { captured, env } = await setup({ choice: "safe", confidence: 0.9 });
+      await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/tmp/a" } });
+      await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/tmp/b" } });
+      await waitForFile(join(userHome, ".pi/agent/gate/decisions.jsonl"), 2);
+      await captured.commands.get("gate:log")!.handler("0", env.ctx({ mode: "rpc" }));
+      const line = env.ui.notified.find((n) => n.includes("gate › last"));
+      expect(line).toContain("last 0 decisions");
+      expect(line).toContain("(none yet)");
+    });
+  });
+
+  describe("auto mode (ADR-0008)", () => {
+    it("gate:config set mode writes the key; invalid values are rejected", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv();
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      const handler = captured.commands.get("gate:config")!.handler;
+      await handler("set mode auto", env.ctx());
+      const cfg = JSON.parse(await readFile(join(userHome, ".pi/agent/gate/config.json"), "utf8"));
+      expect(cfg.mode).toBe("auto");
+      await handler("set mode yolo", env.ctx());
+      expect(JSON.parse(await readFile(join(userHome, ".pi/agent/gate/config.json"), "utf8")).mode).toBe("auto");
+      expect(env.ui.notified.some((n) => n.includes('must be one of "manual", "auto"'))).toBe(true);
+    });
+
+    it("auto mode allows unsure classifications, tags [auto], logs source auto with the session id", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv({ choice: "unsure", confidence: 0.9 });
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      await writeFile(
+        join(userHome, ".pi/agent/gate/config.json"),
+        JSON.stringify({ secrets: { autoUpdate: false }, mode: "auto" }),
+      );
+      const result = await runToolCall(captured, env, {
+        type: "tool_call",
+        toolName: "bash",
+        input: { command: "systemctl restart app" },
+      }, { sessionManager: { getSessionId: () => "sess-abc123def" } });
+      expect(result?.block).toBeUndefined();
+      expect(env.ui.notified.some((n) => n.includes("[auto] ") && n.includes("allowed (auto)"))).toBe(true);
+      const logPath = join(userHome, ".pi/agent/gate/decisions.jsonl");
+      const lines = (await waitForFile(logPath)).trim().split("\n").filter(Boolean);
+      expect(lines.length).toBeGreaterThanOrEqual(1);
+      const record = JSON.parse(lines[0]!);
+      expect(record.source).toBe("auto");
+      expect(record.action).toBe("allow");
+      expect(record.sessionId).toBe("sess-abc123def");
+    });
+
+    it("manual mode still asks on unsure — safe by default", async () => {
+      const { captured, env } = await setup({ choice: "unsure", confidence: 0.9 });
+      const result = await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/tmp/a" } });
+      expect(result?.block).toBe(true);
+    });
+
+    it("/gate status shows the gate mode and the auto-allow count", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv({ choice: "unsure", confidence: 0.9 });
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      await writeFile(
+        join(userHome, ".pi/agent/gate/config.json"),
+        JSON.stringify({ secrets: { autoUpdate: false }, mode: "auto" }),
+      );
+      await runToolCall(captured, env, { type: "tool_call", toolName: "read", input: { path: "/tmp/a" } });
+      await captured.commands.get("gate")!.handler("", env.ctx());
+      const status = env.ui.notified.find((n) => n.includes("Gatekeeper"));
+      expect(status).toContain("Gate mode: auto");
+      expect(status).toContain("auto-allowed");
+    });
+
+    it("gate:log session <prefix> filters to one session; ambiguous prefixes list candidates", async () => {
+      const { captured, env } = await setup({ choice: "safe", confidence: 0.9 });
+      await runToolCall(captured, env, {
+        type: "tool_call",
+        toolName: "read",
+        input: { path: "/tmp/a" },
+      }, { sessionManager: { getSessionId: () => "sess-aaaa" } });
+      await runToolCall(captured, env, {
+        type: "tool_call",
+        toolName: "read",
+        input: { path: "/tmp/b" },
+      }, { sessionManager: { getSessionId: () => "sess-bbbb" } });
+      const handler = captured.commands.get("gate:log")!.handler;
+      await handler("10 session sess-aaaa", env.ctx({ mode: "rpc" }));
+      const one = env.ui.notified.find((n) => n.includes("gate › last"));
+      expect(one).toContain("1 decisions:");
+      await handler("10 session sess", env.ctx({ mode: "rpc" }));
+      const ambiguous = env.ui.notified.find((n) => n.includes("ambiguous"));
+      expect(ambiguous).toContain("sess-aaaa");
+      expect(ambiguous).toContain("sess-bbbb");
+    });
+
+    it("log.columns is whitelisted and validated against the registry", async () => {
+      const { pi, captured } = fakePi();
+      const env = makeEnv();
+      createGatekeeper(pi, { home: userHome, fetchFn: env.fetchFn });
+      const handler = captured.commands.get("gate:config")!.handler;
+      await handler("set log.columns time,tool,session,reason", env.ctx());
+      const cfg = JSON.parse(await readFile(join(userHome, ".pi/agent/gate/config.json"), "utf8"));
+      expect(cfg.log.columns).toEqual(["time", "tool", "session", "reason"]);
+      await handler("set log.columns time,bogus", env.ctx());
+      expect(JSON.parse(await readFile(join(userHome, ".pi/agent/gate/config.json"), "utf8")).log.columns)
+        .toEqual(["time", "tool", "session", "reason"]);
+      expect(env.ui.notified.some((n) => n.includes("must be a comma-separated list from:"))).toBe(true);
+    });
+
   });
 });
